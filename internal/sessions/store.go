@@ -25,10 +25,13 @@ type EventType string
 const (
 	EventMessage       EventType = "message"
 	EventToolCall      EventType = "tool_call"
+	EventPermission    EventType = "permission"
 	EventToolResult    EventType = "tool_result"
 	EventProviderUsage EventType = "provider_usage"
 	EventUsage         EventType = EventProviderUsage
 	EventError         EventType = "error"
+	EventSessionRewind EventType = "session_rewind"
+	EventCompaction    EventType = "session_compaction"
 	EventSessionFork   EventType = "session_fork"
 	EventSessionChild  EventType = "session_child"
 )
