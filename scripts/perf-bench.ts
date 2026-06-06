@@ -1,13 +1,11 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { runAgent } from '../src/agent/loop';
-import type { Message, Provider, StreamEvent, ToolDefinition } from '../src/providers/types';
 import { zeroArtifactName, zeroArtifactPath } from './artifact';
 
 export interface PerfThresholds {
   coldStartP95Ms: number;
-  ttftP95Ms: number;
-  agentRssMaxMb: number;
+  firstOutputP95Ms: number;
+  harnessEndRssMaxMb: number;
 }
 
 export interface NumericStats {
@@ -21,10 +19,10 @@ export interface NumericStats {
 
 export interface PerfMetrics {
   coldStartMs: NumericStats;
-  ttftMs: NumericStats;
-  streamOverheadMs: NumericStats;
-  agentRssMb: NumericStats;
-  agentRssDeltaMb: NumericStats;
+  firstOutputMs: NumericStats;
+  processDrainMs: NumericStats;
+  harnessEndRssMb: NumericStats;
+  harnessEndRssDeltaMb: NumericStats;
 }
 
 export interface PerfWarning {
@@ -37,7 +35,7 @@ export interface PerfWarning {
 }
 
 export interface PerfBenchResult {
-  schemaVersion: 1;
+  schemaVersion: 2;
   timestamp: string;
   platform: {
     os: NodeJS.Platform;
@@ -45,6 +43,7 @@ export interface PerfBenchResult {
     bunVersion: string;
   };
   coldStartCommand: string[];
+  firstOutputCommand: string[];
   iterations: number;
   warmupIterations: number;
   thresholds: PerfThresholds;
@@ -58,6 +57,7 @@ export interface PerfBenchOptions {
   warmupIterations: number;
   thresholds: PerfThresholds;
   coldStartCommand?: string[];
+  firstOutputCommand?: string[];
 }
 
 export interface PerfBenchCliOptions extends PerfBenchOptions {
@@ -68,11 +68,11 @@ export interface PerfBenchCliOptions extends PerfBenchOptions {
   help: boolean;
 }
 
-interface TtftSample {
-  ttftMs: number;
-  streamOverheadMs: number;
-  agentRssMb: number;
-  agentRssDeltaMb: number;
+interface FirstOutputSample {
+  firstOutputMs: number;
+  processDrainMs: number;
+  harnessEndRssMb: number;
+  harnessEndRssDeltaMb: number;
 }
 
 const DEFAULT_ITERATIONS = 5;
@@ -80,8 +80,8 @@ const DEFAULT_WARMUP_ITERATIONS = 1;
 
 export const DEFAULT_PERF_THRESHOLDS: PerfThresholds = {
   coldStartP95Ms: 300,
-  ttftP95Ms: 500,
-  agentRssMaxMb: 256,
+  firstOutputP95Ms: 500,
+  harnessEndRssMaxMb: 256,
 };
 
 export function summarizeSamples(samples: number[]): NumericStats {
@@ -115,14 +115,21 @@ export function evaluatePerfWarnings(
       'ms',
       'Cold start p95'
     ),
-    createWarning('ttftMs', 'p95', metrics.ttftMs.p95, thresholds.ttftP95Ms, 'ms', 'TTFT p95'),
     createWarning(
-      'agentRssMb',
+      'firstOutputMs',
+      'p95',
+      metrics.firstOutputMs.p95,
+      thresholds.firstOutputP95Ms,
+      'ms',
+      'Binary first-output p95'
+    ),
+    createWarning(
+      'harnessEndRssMb',
       'max',
-      metrics.agentRssMb.max,
-      thresholds.agentRssMaxMb,
+      metrics.harnessEndRssMb.max,
+      thresholds.harnessEndRssMaxMb,
       'MB',
-      'Agent RSS peak'
+      'Benchmark harness end RSS'
     ),
   ].filter((warning): warning is PerfWarning => warning !== undefined);
 }
@@ -131,11 +138,12 @@ export function formatPerfSummary(result: PerfBenchResult): string {
   const lines = [
     `Zero performance benchmark (${result.platform.os}/${result.platform.arch}, Bun ${result.platform.bunVersion})`,
     `command: ${formatCommand(result.coldStartCommand)}`,
+    `first-output command: ${formatCommand(result.firstOutputCommand)}`,
     `iterations: ${result.iterations} measured, ${result.warmupIterations} warmup`,
     `cold start: median ${formatMetric(result.metrics.coldStartMs.median, 'ms')}, p95 ${formatMetric(result.metrics.coldStartMs.p95, 'ms')} (warn > ${formatMetric(result.thresholds.coldStartP95Ms, 'ms')})`,
-    `TTFT: median ${formatMetric(result.metrics.ttftMs.median, 'ms')}, p95 ${formatMetric(result.metrics.ttftMs.p95, 'ms')} (warn > ${formatMetric(result.thresholds.ttftP95Ms, 'ms')})`,
-    `stream overhead: median ${formatMetric(result.metrics.streamOverheadMs.median, 'ms')}, p95 ${formatMetric(result.metrics.streamOverheadMs.p95, 'ms')}`,
-    `agent RSS: peak ${formatMetric(result.metrics.agentRssMb.max, 'MB')}, max delta ${formatMetric(result.metrics.agentRssDeltaMb.max, 'MB')} (warn > ${formatMetric(result.thresholds.agentRssMaxMb, 'MB')})`,
+    `binary first output: median ${formatMetric(result.metrics.firstOutputMs.median, 'ms')}, p95 ${formatMetric(result.metrics.firstOutputMs.p95, 'ms')} (warn > ${formatMetric(result.thresholds.firstOutputP95Ms, 'ms')})`,
+    `process drain: median ${formatMetric(result.metrics.processDrainMs.median, 'ms')}, p95 ${formatMetric(result.metrics.processDrainMs.p95, 'ms')}`,
+    `harness end RSS: max ${formatMetric(result.metrics.harnessEndRssMb.max, 'MB')}, max end delta ${formatMetric(result.metrics.harnessEndRssDeltaMb.max, 'MB')} (warn > ${formatMetric(result.thresholds.harnessEndRssMaxMb, 'MB')})`,
   ];
 
   if (result.warnings.length > 0) {
@@ -167,15 +175,15 @@ export function parsePerfBenchArgs(
         'ZERO_PERF_COLD_START_WARN_MS',
         DEFAULT_PERF_THRESHOLDS.coldStartP95Ms
       ),
-      ttftP95Ms: readPositiveNumberEnv(
+      firstOutputP95Ms: readPositiveNumberEnv(
         env,
-        'ZERO_PERF_TTFT_WARN_MS',
-        DEFAULT_PERF_THRESHOLDS.ttftP95Ms
+        'ZERO_PERF_FIRST_OUTPUT_WARN_MS',
+        DEFAULT_PERF_THRESHOLDS.firstOutputP95Ms
       ),
-      agentRssMaxMb: readPositiveNumberEnv(
+      harnessEndRssMaxMb: readPositiveNumberEnv(
         env,
-        'ZERO_PERF_RSS_WARN_MB',
-        DEFAULT_PERF_THRESHOLDS.agentRssMaxMb
+        'ZERO_PERF_HARNESS_END_RSS_WARN_MB',
+        DEFAULT_PERF_THRESHOLDS.harnessEndRssMaxMb
       ),
     },
     ci: env.GITHUB_ACTIONS === 'true',
@@ -207,15 +215,15 @@ export function parsePerfBenchArgs(
         );
         if (inlineValue !== undefined) index--;
         break;
-      case '--ttft-warn-ms':
-        options.thresholds.ttftP95Ms = parsePositiveNumber(
+      case '--first-output-warn-ms':
+        options.thresholds.firstOutputP95Ms = parsePositiveNumber(
           flag,
           readOptionValue(args, inlineValue, ++index, flag)
         );
         if (inlineValue !== undefined) index--;
         break;
-      case '--rss-warn-mb':
-        options.thresholds.agentRssMaxMb = parsePositiveNumber(
+      case '--harness-end-rss-warn-mb':
+        options.thresholds.harnessEndRssMaxMb = parsePositiveNumber(
           flag,
           readOptionValue(args, inlineValue, ++index, flag)
         );
@@ -258,8 +266,9 @@ export function perfBenchHelp(): string {
     '  --iterations <n>             Measured samples to collect (default: 5)',
     '  --warmup <n>                 Warmup samples to discard (default: 1)',
     '  --cold-start-warn-ms <n>     Warn when cold-start p95 is above n ms',
-    '  --ttft-warn-ms <n>           Warn when TTFT p95 is above n ms',
-    '  --rss-warn-mb <n>            Warn when agent RSS peak is above n MB',
+    '  --first-output-warn-ms <n>   Warn when binary first-output p95 is above n ms',
+    '  --harness-end-rss-warn-mb <n>',
+    '                               Warn when harness end-state RSS is above n MB',
     '  --output <path>              Write the JSON report to path',
     '  --json                       Print only the JSON report',
     '  --ci                         Emit GitHub Actions warning annotations',
@@ -268,36 +277,42 @@ export function perfBenchHelp(): string {
     '',
     'Environment overrides:',
     '  ZERO_PERF_ITERATIONS, ZERO_PERF_WARMUP_ITERATIONS',
-    '  ZERO_PERF_COLD_START_WARN_MS, ZERO_PERF_TTFT_WARN_MS, ZERO_PERF_RSS_WARN_MB',
+    '  ZERO_PERF_COLD_START_WARN_MS, ZERO_PERF_FIRST_OUTPUT_WARN_MS',
+    '  ZERO_PERF_HARNESS_END_RSS_WARN_MB',
   ].join('\n');
 }
 
 export async function runPerfBench(options: PerfBenchOptions): Promise<PerfBenchResult> {
   const benchmarkStartedAt = performance.now();
   const coldStartCommand = options.coldStartCommand ?? await resolveColdStartCommand();
+  const firstOutputCommand = options.firstOutputCommand ?? await resolveFirstOutputCommand();
   const coldStartSamples: number[] = [];
-  const ttftSamples: TtftSample[] = [];
+  const firstOutputSamples: FirstOutputSample[] = [];
 
   for (let i = 0; i < options.warmupIterations; i++) {
     await measureColdStart(coldStartCommand);
-    await measureTtft();
+    await measureFirstOutput(firstOutputCommand);
   }
 
   for (let i = 0; i < options.iterations; i++) {
     coldStartSamples.push(await measureColdStart(coldStartCommand));
-    ttftSamples.push(await measureTtft());
+    firstOutputSamples.push(await measureFirstOutput(firstOutputCommand));
   }
 
   const metrics: PerfMetrics = {
     coldStartMs: summarizeSamples(coldStartSamples),
-    ttftMs: summarizeSamples(ttftSamples.map((sample) => sample.ttftMs)),
-    streamOverheadMs: summarizeSamples(ttftSamples.map((sample) => sample.streamOverheadMs)),
-    agentRssMb: summarizeSamples(ttftSamples.map((sample) => sample.agentRssMb)),
-    agentRssDeltaMb: summarizeSamples(ttftSamples.map((sample) => sample.agentRssDeltaMb)),
+    firstOutputMs: summarizeSamples(firstOutputSamples.map((sample) => sample.firstOutputMs)),
+    processDrainMs: summarizeSamples(firstOutputSamples.map((sample) => sample.processDrainMs)),
+    harnessEndRssMb: summarizeSamples(
+      firstOutputSamples.map((sample) => sample.harnessEndRssMb)
+    ),
+    harnessEndRssDeltaMb: summarizeSamples(
+      firstOutputSamples.map((sample) => sample.harnessEndRssDeltaMb)
+    ),
   };
 
   const result: PerfBenchResult = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     timestamp: new Date().toISOString(),
     platform: {
       os: process.platform,
@@ -305,6 +320,7 @@ export async function runPerfBench(options: PerfBenchOptions): Promise<PerfBench
       bunVersion: Bun.version,
     },
     coldStartCommand,
+    firstOutputCommand,
     iterations: options.iterations,
     warmupIterations: options.warmupIterations,
     thresholds: options.thresholds,
@@ -361,6 +377,14 @@ async function resolveColdStartCommand(): Promise<string[]> {
   throw new Error(`No ${zeroArtifactName} binary found. Run \`bun run build\` before running the performance benchmark.`);
 }
 
+async function resolveFirstOutputCommand(): Promise<string[]> {
+  if (await Bun.file(zeroArtifactPath).exists()) {
+    return [zeroArtifactPath, '--version'];
+  }
+
+  throw new Error(`No ${zeroArtifactName} binary found. Run \`bun run build\` before running the performance benchmark.`);
+}
+
 async function measureColdStart(command: string[]): Promise<number> {
   const startedAt = performance.now();
   const child = Bun.spawn(command, {
@@ -388,48 +412,41 @@ async function measureColdStart(command: string[]): Promise<number> {
   return durationMs;
 }
 
-async function measureTtft(): Promise<TtftSample> {
+async function measureFirstOutput(command: string[]): Promise<FirstOutputSample> {
   const rssBefore = readRssMb();
   const startedAt = performance.now();
-  let providerFirstByteAt: number | undefined;
-  let firstTextAt: number | undefined;
-
-  const provider = new ImmediateTextProvider((at) => {
-    providerFirstByteAt = at;
+  const child = Bun.spawn(command, {
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: offlineBenchmarkEnv(),
   });
 
-  await runAgent('Reply with "ok".', provider, {
-    maxTurns: 1,
-    onText: () => {
-      firstTextAt ??= performance.now();
-    },
-  });
-
+  let firstOutputAt: number | undefined;
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    readTimedSpawnStream(child.stdout, () => {
+      firstOutputAt ??= performance.now();
+    }),
+    readTimedSpawnStream(child.stderr, () => {
+      firstOutputAt ??= performance.now();
+    }),
+  ]);
   const finishedAt = performance.now();
   const rssAfter = readRssMb();
-  const observedFirstTextAt = firstTextAt ?? finishedAt;
-  const streamOverheadMs =
-    providerFirstByteAt === undefined ? 0 : observedFirstTextAt - providerFirstByteAt;
+  const observedFirstOutputAt = firstOutputAt ?? finishedAt;
+
+  if (exitCode !== 0) {
+    throw new Error(
+      `${formatCommand(command)} exited with ${exitCode}: ${stderr.trim() || stdout.trim() || 'no output'}`
+    );
+  }
 
   return {
-    ttftMs: roundMetric(observedFirstTextAt - startedAt),
-    streamOverheadMs: roundMetric(Math.max(0, streamOverheadMs)),
-    agentRssMb: roundMetric(rssAfter),
-    agentRssDeltaMb: roundMetric(Math.max(0, rssAfter - rssBefore)),
+    firstOutputMs: roundMetric(observedFirstOutputAt - startedAt),
+    processDrainMs: roundMetric(Math.max(0, finishedAt - observedFirstOutputAt)),
+    harnessEndRssMb: roundMetric(rssAfter),
+    harnessEndRssDeltaMb: roundMetric(Math.max(0, rssAfter - rssBefore)),
   };
-}
-
-class ImmediateTextProvider implements Provider {
-  constructor(private readonly onFirstByte: (at: number) => void) {}
-
-  async *streamCompletion(
-    _messages: Message[],
-    _tools: ToolDefinition[]
-  ): AsyncIterable<StreamEvent> {
-    this.onFirstByte(performance.now());
-    yield { type: 'text', content: 'ok' };
-    yield { type: 'done' };
-  }
 }
 
 function createWarning(
@@ -465,6 +482,62 @@ function readRssMb(): number {
 async function readSpawnStream(stream: ReadableStream<Uint8Array> | null): Promise<string> {
   if (!stream) return '';
   return new Response(stream).text();
+}
+
+async function readTimedSpawnStream(
+  stream: ReadableStream<Uint8Array> | null,
+  onFirstChunk: () => void
+): Promise<string> {
+  if (!stream) return '';
+
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (value.length > 0 && chunks.length === 0) {
+      onFirstChunk();
+    }
+    if (value.length > 0) {
+      chunks.push(value);
+    }
+  }
+
+  return new TextDecoder().decode(joinChunks(chunks));
+}
+
+function joinChunks(chunks: Uint8Array[]): Uint8Array {
+  const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
+  const joined = new Uint8Array(length);
+  let offset = 0;
+
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  return joined;
+}
+
+function offlineBenchmarkEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.ZERO_PROVIDER_COMMAND;
+  delete env.ZERO_PROVIDER;
+  delete env.OPENAI_API_KEY;
+  delete env.OPENAI_BASE_URL;
+  delete env.OPENAI_MODEL;
+  delete env.ANTHROPIC_API_KEY;
+  delete env.ANTHROPIC_BASE_URL;
+  delete env.ANTHROPIC_MODEL;
+  delete env.GEMINI_API_KEY;
+  delete env.GEMINI_BASE_URL;
+  delete env.GEMINI_MODEL;
+  delete env.GOOGLE_API_KEY;
+  delete env.GOOGLE_BASE_URL;
+  delete env.GOOGLE_MODEL;
+  env.NO_COLOR = '1';
+  return env;
 }
 
 function percentile(sortedSamples: number[], percentileValue: number): number {
