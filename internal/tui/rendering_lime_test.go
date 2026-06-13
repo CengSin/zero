@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Gitlawb/zero/internal/agent"
+	"github.com/Gitlawb/zero/internal/config"
 	"github.com/Gitlawb/zero/internal/sandbox"
 	"github.com/Gitlawb/zero/internal/tools"
 )
@@ -672,13 +673,13 @@ func TestComposerLineTracksRunState(t *testing.T) {
 	}
 
 	m.pending = true
-	if got := plainRender(t, m.composerLine(96)); !strings.Contains(got, "esc stop") {
-		t.Fatalf("pending composer = %q, want esc stop hint", got)
+	if got := plainRender(t, m.composerLine(96)); strings.Contains(got, "esc stop") || strings.Contains(got, "esc to interrupt") {
+		t.Fatalf("pending composer = %q, should not show stop hint", got)
 	}
 
 	m.input.SetValue("")
-	if got := plainRender(t, m.composerLine(96)); !strings.Contains(got, composerPlaceholderRunning) {
-		t.Fatalf("pending empty composer = %q, want running placeholder", got)
+	if got := plainRender(t, m.composerLine(96)); !strings.Contains(got, composerPlaceholder) || strings.Contains(got, "running") || strings.Contains(got, "stop") || strings.Contains(got, "interrupt") {
+		t.Fatalf("pending empty composer = %q, should show normal placeholder without run status text", got)
 	}
 }
 
@@ -730,6 +731,39 @@ func TestComposerBoxFramesInputAndBottomModelModeLabel(t *testing.T) {
 		t.Fatalf("composer box = %q, should not show run hint", got)
 	}
 	assertRenderedLineWidths(t, got, 96)
+}
+
+func TestComposerBoxWrapsLongPrompt(t *testing.T) {
+	m := limeTestModel()
+	m.input.SetValue("Create a book library dashboard page with the Bootstrap 5.3 theme displaying a grid of book cards showing cover images, titles, authors, and reading progress bars.")
+	m.input.CursorEnd()
+
+	got := plainRender(t, m.composerBox(72))
+	if !strings.Contains(got, "Bootstrap 5.3") || !strings.Contains(got, "reading progress bars") {
+		t.Fatalf("composer box should show wrapped long prompt, got:\n%s", got)
+	}
+	if lineCount := len(strings.Split(got, "\n")); lineCount < 5 {
+		t.Fatalf("composer box line count = %d, want wrapped multi-line box:\n%s", lineCount, got)
+	}
+	assertRenderedLineWidths(t, got, 72)
+}
+
+func TestComposerBoxCapsLongPromptHeightAroundCursor(t *testing.T) {
+	m := limeTestModel()
+	m.input.SetValue(strings.Repeat("alpha beta gamma delta ", 12) + "final words")
+	m.input.CursorEnd()
+
+	got := plainRender(t, m.composerBox(44))
+	if lineCount := len(strings.Split(got, "\n")); lineCount != composerMaxVisibleLines+2 {
+		t.Fatalf("composer box line count = %d, want %d:\n%s", lineCount, composerMaxVisibleLines+2, got)
+	}
+	if !strings.Contains(got, "final words") {
+		t.Fatalf("composer box should keep cursor-adjacent tail visible, got:\n%s", got)
+	}
+	if !strings.Contains(got, "❯") {
+		t.Fatalf("composer box should keep the prompt marker visible when capped, got:\n%s", got)
+	}
+	assertRenderedLineWidths(t, got, 44)
 }
 
 func TestMalformedAskUserToolResultIsHiddenFromChatSurface(t *testing.T) {
@@ -789,6 +823,32 @@ func TestTitleBarShowsBadgeAndModel(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("title bar = %q, missing %q", got, want)
 		}
+	}
+}
+
+func TestGenericCustomProviderDisplayUsesEndpointName(t *testing.T) {
+	m := newModel(context.Background(), Options{
+		ProviderName: "custom-openai-compatible",
+		ModelName:    "MiniMax-M3",
+		ProviderProfile: config.ProviderProfile{
+			Name:      "custom-openai-compatible",
+			CatalogID: "custom-openai-compatible",
+			BaseURL:   "https://api.minimax.io/v1",
+			Model:     "MiniMax-M3",
+		},
+	})
+
+	title := plainRender(t, m.titleBar(120))
+	if !strings.Contains(title, "minimax/MiniMax-M3") {
+		t.Fatalf("title bar = %q, want derived custom provider label", title)
+	}
+	if strings.Contains(title, "custom-openai-compatible/MiniMax-M3") {
+		t.Fatalf("title bar = %q, should not show generic custom catalog id", title)
+	}
+
+	status := plainRender(t, m.statusLine(100))
+	if !strings.Contains(status, "● minimax") {
+		t.Fatalf("status line = %q, want derived custom provider label", status)
 	}
 }
 

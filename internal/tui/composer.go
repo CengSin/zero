@@ -1,16 +1,26 @@
 package tui
 
 import (
+	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type composerState struct {
 	text   string
 	cursor int
+}
+
+type composerPastePreview struct {
+	active bool
+	start  int
+	end    int
+	label  string
 }
 
 func insertComposerText(state composerState, text string) composerState {
@@ -150,12 +160,14 @@ func (m *model) setComposerState(state composerState) {
 func (m *model) clearComposer() {
 	m.composer = composerState{}
 	m.composerActive = false
+	m.composerPastePreviews = nil
 	m.input.SetValue("")
 }
 
 func (m *model) resetComposerFromInput() {
 	m.composer = composerState{}
 	m.composerActive = false
+	m.composerPastePreviews = nil
 }
 
 func (m *model) syncInputFromComposer() {
@@ -177,11 +189,14 @@ func (m model) applyComposerKey(msg tea.KeyMsg) (model, bool) {
 	state := m.currentComposerState()
 	switch {
 	case msg.Type == tea.KeyEnter && msg.Alt:
-		m.setComposerState(insertComposerText(state, "\n"))
+		m = m.insertComposerTextWithPastePreview(state, "\n", "")
 	case msg.Type == tea.KeyCtrlJ:
-		m.setComposerState(insertComposerText(state, "\n"))
+		m = m.insertComposerTextWithPastePreview(state, "\n", "")
 	case msg.Type == tea.KeyRunes && msg.Alt && string(msg.Runes) == "d":
-		m.setComposerState(deleteComposerWordAfter(state))
+		end := deleteComposerWordAfter(state).cursor
+		nextState, nextPreviews := deleteComposerRangeWithPastePreviews(state, m.composerPastePreviews, state.cursor, end)
+		m.setComposerState(nextState)
+		m.composerPastePreviews = nextPreviews
 	case (msg.Type == tea.KeyLeft || msg.Type == tea.KeyCtrlLeft) && msg.Alt:
 		m.setComposerState(moveComposerWordBefore(state))
 	case (msg.Type == tea.KeyRight || msg.Type == tea.KeyCtrlRight) && msg.Alt:
@@ -195,22 +210,35 @@ func (m model) applyComposerKey(msg tea.KeyMsg) (model, bool) {
 	case msg.Type == tea.KeyRunes && msg.Alt && string(msg.Runes) == "f":
 		m.setComposerState(moveComposerWordAfter(state))
 	case msg.Type == tea.KeySpace:
-		m.setComposerState(insertComposerText(state, " "))
+		m = m.insertComposerTextWithPastePreview(state, " ", "")
 	case msg.Type == tea.KeyRunes && !msg.Alt:
 		text := string(msg.Runes)
+		previewLabel := ""
 		if msg.Paste {
 			text = sanitizeComposerPaste(text)
+			previewLabel, _ = composerPastePreviewLabel(text, m.composerPastePreviewWrapWidth())
 		} else {
 			text = sanitizeComposerInput(text)
 		}
 		if shouldInsertCommandArgumentSpace(state, text) {
 			text = " " + text
+			if previewLabel != "" {
+				previewLabel = " " + previewLabel
+			}
 		}
-		m.setComposerState(insertComposerText(state, text))
+		m = m.insertComposerTextWithPastePreview(state, text, previewLabel)
 	case msg.Type == tea.KeyLeft || msg.Type == tea.KeyCtrlB:
+		if nextState, ok := moveComposerPastePreviewBoundary(state, m.composerPastePreviews, -1); ok {
+			m.setComposerState(nextState)
+			break
+		}
 		state.cursor--
 		m.setComposerState(state)
 	case msg.Type == tea.KeyRight || msg.Type == tea.KeyCtrlF:
+		if nextState, ok := moveComposerPastePreviewBoundary(state, m.composerPastePreviews, 1); ok {
+			m.setComposerState(nextState)
+			break
+		}
 		state.cursor++
 		m.setComposerState(state)
 	case msg.Type == tea.KeyHome || msg.Type == tea.KeyCtrlA:
@@ -220,21 +248,45 @@ func (m model) applyComposerKey(msg tea.KeyMsg) (model, bool) {
 		state.cursor = composerLineEnd(state)
 		m.setComposerState(state)
 	case msg.Type == tea.KeyCtrlU:
-		m.setComposerState(deleteComposerLineBefore(state))
+		nextState, nextPreviews := deleteComposerRangeWithPastePreviews(state, m.composerPastePreviews, composerLineStart(state), state.cursor)
+		m.setComposerState(nextState)
+		m.composerPastePreviews = nextPreviews
 	case msg.Type == tea.KeyCtrlK:
-		m.setComposerState(deleteComposerLineAfter(state))
+		nextState, nextPreviews := deleteComposerRangeWithPastePreviews(state, m.composerPastePreviews, state.cursor, composerLineEnd(state))
+		m.setComposerState(nextState)
+		m.composerPastePreviews = nextPreviews
 	case msg.Type == tea.KeyCtrlW || (msg.Alt && (msg.Type == tea.KeyBackspace || msg.Type == tea.KeyCtrlH)):
-		m.setComposerState(deleteComposerWordBefore(state))
+		start := deleteComposerWordBefore(state).cursor
+		nextState, nextPreviews := deleteComposerRangeWithPastePreviews(state, m.composerPastePreviews, start, state.cursor)
+		m.setComposerState(nextState)
+		m.composerPastePreviews = nextPreviews
 	case msg.Alt && msg.Type == tea.KeyDelete:
-		m.setComposerState(deleteComposerWordAfter(state))
+		end := deleteComposerWordAfter(state).cursor
+		nextState, nextPreviews := deleteComposerRangeWithPastePreviews(state, m.composerPastePreviews, state.cursor, end)
+		m.setComposerState(nextState)
+		m.composerPastePreviews = nextPreviews
 	case msg.Type == tea.KeyBackspace || msg.Type == tea.KeyCtrlH:
-		if nextState, ok := deleteCompletedFileMentionBefore(state); ok && !m.suggestionsActive() {
+		if nextState, nextPreviews, ok := deleteComposerPastePreviewBefore(state, m.composerPastePreviews); ok && !m.suggestionsActive() {
 			m.setComposerState(nextState)
+			m.composerPastePreviews = nextPreviews
+		} else if start, end, ok := completedFileMentionRangeBefore(state); ok && !m.suggestionsActive() {
+			nextState, nextPreviews := deleteComposerRangeWithPastePreviews(state, m.composerPastePreviews, start, end)
+			m.setComposerState(nextState)
+			m.composerPastePreviews = nextPreviews
 		} else {
-			m.setComposerState(deleteComposerRange(state, state.cursor-1, state.cursor))
+			nextState, nextPreviews := deleteComposerRangeWithPastePreviews(state, m.composerPastePreviews, state.cursor-1, state.cursor)
+			m.setComposerState(nextState)
+			m.composerPastePreviews = nextPreviews
 		}
 	case msg.Type == tea.KeyDelete || msg.Type == tea.KeyCtrlD:
-		m.setComposerState(deleteComposerRange(state, state.cursor, state.cursor+1))
+		if nextState, nextPreviews, ok := deleteComposerPastePreviewAfter(state, m.composerPastePreviews); ok {
+			m.setComposerState(nextState)
+			m.composerPastePreviews = nextPreviews
+		} else {
+			nextState, nextPreviews := deleteComposerRangeWithPastePreviews(state, m.composerPastePreviews, state.cursor, state.cursor+1)
+			m.setComposerState(nextState)
+			m.composerPastePreviews = nextPreviews
+		}
 	default:
 		return m, false
 	}
@@ -245,6 +297,269 @@ func (m model) applyComposerKey(msg tea.KeyMsg) (model, bool) {
 		m.recomputeSuggestions()
 	}
 	return m, true
+}
+
+func (m model) insertComposerTextWithPastePreview(state composerState, text string, previewLabel string) model {
+	state = normalizeComposerState(state)
+	insertStart := state.cursor
+	insertedRunes := len([]rune(text))
+	nextPreviews := composerPastePreviewsAfterInsert(m.composerPastePreviews, insertStart, insertedRunes)
+	m.setComposerState(insertComposerText(state, text))
+	if previewLabel != "" && insertedRunes > 0 {
+		previewLabel = composerPastePreviewLabelWithIndex(previewLabel, len(nextPreviews)+1)
+		nextPreviews = append(nextPreviews, composerPastePreview{
+			active: true,
+			start:  insertStart,
+			end:    insertStart + insertedRunes,
+			label:  previewLabel,
+		})
+		sortComposerPastePreviews(nextPreviews)
+		m.composerPastePreviews = nextPreviews
+		return m
+	}
+	m.composerPastePreviews = nextPreviews
+	return m
+}
+
+func (m model) replaceComposerRangeWithPastePreviews(state composerState, start int, end int, replacement string) model {
+	nextState, nextPreviews := deleteComposerRangeWithPastePreviews(state, m.composerPastePreviews, start, end)
+	m.setComposerState(nextState)
+	m.composerPastePreviews = nextPreviews
+	if replacement == "" {
+		return m
+	}
+	return m.insertComposerTextWithPastePreview(m.currentComposerState(), replacement, "")
+}
+
+func (m model) composerPastePreviewWrapWidth() int {
+	width := chatWidth(m.width)
+	if width < 8 {
+		width = defaultStartupWidth
+	}
+	return maxInt(1, width-4-lipgloss.Width(m.input.Prompt))
+}
+
+func composerPastePreviewLabel(text string, wrapWidth int) (string, bool) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", false
+	}
+	runeCount := len([]rune(text))
+	lineCount := composerPastePreviewVisualLineCount(text, wrapWidth)
+	if lineCount < 3 && runeCount < 220 {
+		return "", false
+	}
+	snippet := text
+	if newline := strings.IndexRune(snippet, '\n'); newline >= 0 {
+		snippet = snippet[:newline]
+	}
+	snippet = strings.Join(strings.Fields(snippet), " ")
+	if snippet == "" {
+		snippet = "pasted text"
+	}
+	snippet = truncateComposerPasteSnippet(snippet, 48)
+	label := "lines"
+	if lineCount == 1 {
+		label = "line"
+	}
+	return "[" + snippet + " · " + strconv.Itoa(lineCount) + " " + label + "]", true
+}
+
+func composerPastePreviewLabelWithIndex(label string, pasteNumber int) string {
+	if pasteNumber <= 1 || !strings.HasSuffix(label, "]") {
+		return label
+	}
+	return strings.TrimSuffix(label, "]") + ", paste " + strconv.Itoa(pasteNumber) + "]"
+}
+
+func composerPastePreviewVisualLineCount(text string, wrapWidth int) int {
+	wrapWidth = maxInt(1, wrapWidth)
+	total := 0
+	for _, line := range strings.Split(text, "\n") {
+		width := lipgloss.Width(line)
+		total += maxInt(1, (width+wrapWidth-1)/wrapWidth)
+	}
+	return total
+}
+
+func truncateComposerPasteSnippet(text string, limit int) string {
+	runes := []rune(text)
+	if limit <= 3 || len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit-3]) + "..."
+}
+
+func composerPastePreviewsAfterInsert(previews []composerPastePreview, pos int, length int) []composerPastePreview {
+	if length <= 0 || len(previews) == 0 {
+		return previews
+	}
+	next := make([]composerPastePreview, 0, len(previews))
+	for _, preview := range previews {
+		if !preview.active {
+			continue
+		}
+		switch {
+		case pos <= preview.start:
+			preview.start += length
+			preview.end += length
+		case pos < preview.end:
+			continue
+		}
+		next = append(next, preview)
+	}
+	sortComposerPastePreviews(next)
+	return next
+}
+
+func moveComposerPastePreviewBoundary(state composerState, previews []composerPastePreview, direction int) (composerState, bool) {
+	state = normalizeComposerState(state)
+	for _, preview := range validComposerPastePreviews(state, previews) {
+		switch {
+		case direction < 0 && state.cursor > preview.start && state.cursor <= preview.end:
+			state.cursor = preview.start
+			return state, true
+		case direction > 0 && state.cursor >= preview.start && state.cursor < preview.end:
+			state.cursor = preview.end
+			return state, true
+		}
+	}
+	return state, false
+}
+
+func deleteComposerPastePreviewBefore(state composerState, previews []composerPastePreview) (composerState, []composerPastePreview, bool) {
+	state = normalizeComposerState(state)
+	valid := validComposerPastePreviews(state, previews)
+	for index, preview := range valid {
+		if state.cursor != preview.end {
+			continue
+		}
+		return deleteComposerRange(state, preview.start, preview.end), composerPastePreviewsAfterDelete(valid, index), true
+	}
+	return state, previews, false
+}
+
+func deleteComposerPastePreviewAfter(state composerState, previews []composerPastePreview) (composerState, []composerPastePreview, bool) {
+	state = normalizeComposerState(state)
+	valid := validComposerPastePreviews(state, previews)
+	for index, preview := range valid {
+		if state.cursor != preview.start {
+			continue
+		}
+		return deleteComposerRange(state, preview.start, preview.end), composerPastePreviewsAfterDelete(valid, index), true
+	}
+	return state, previews, false
+}
+
+func deleteComposerRangeWithPastePreviews(state composerState, previews []composerPastePreview, start int, end int) (composerState, []composerPastePreview) {
+	state = normalizeComposerState(state)
+	runeCount := len([]rune(state.text))
+	start = clamp(start, 0, runeCount)
+	end = clamp(end, 0, runeCount)
+	if end < start {
+		start, end = end, start
+	}
+	if start == end {
+		return state, validComposerPastePreviews(state, previews)
+	}
+
+	valid := validComposerPastePreviews(state, previews)
+	deleteStart, deleteEnd := start, end
+	for {
+		expanded := false
+		for _, preview := range valid {
+			if !composerRangesOverlap(deleteStart, deleteEnd, preview.start, preview.end) {
+				continue
+			}
+			if preview.start < deleteStart {
+				deleteStart = preview.start
+				expanded = true
+			}
+			if preview.end > deleteEnd {
+				deleteEnd = preview.end
+				expanded = true
+			}
+		}
+		if !expanded {
+			break
+		}
+	}
+
+	nextState := deleteComposerRange(state, deleteStart, deleteEnd)
+	delta := deleteEnd - deleteStart
+	nextPreviews := make([]composerPastePreview, 0, len(valid))
+	for _, preview := range valid {
+		switch {
+		case composerRangesOverlap(deleteStart, deleteEnd, preview.start, preview.end):
+			continue
+		case preview.start >= deleteEnd:
+			preview.start -= delta
+			preview.end -= delta
+		}
+		nextPreviews = append(nextPreviews, preview)
+	}
+	sortComposerPastePreviews(nextPreviews)
+	return nextState, nextPreviews
+}
+
+func composerRangesOverlap(leftStart int, leftEnd int, rightStart int, rightEnd int) bool {
+	return leftStart < rightEnd && rightStart < leftEnd
+}
+
+func validComposerPastePreviews(state composerState, previews []composerPastePreview) []composerPastePreview {
+	state = normalizeComposerState(state)
+	if len(previews) == 0 {
+		return nil
+	}
+	runeCount := len([]rune(state.text))
+	valid := make([]composerPastePreview, 0, len(previews))
+	for _, preview := range previews {
+		if !preview.active || preview.label == "" || preview.start < 0 || preview.start >= preview.end || preview.end > runeCount {
+			continue
+		}
+		valid = append(valid, preview)
+	}
+	sortComposerPastePreviews(valid)
+	out := valid[:0]
+	lastEnd := -1
+	for _, preview := range valid {
+		if preview.start < lastEnd {
+			continue
+		}
+		out = append(out, preview)
+		lastEnd = preview.end
+	}
+	return out
+}
+
+func sortComposerPastePreviews(previews []composerPastePreview) {
+	sort.SliceStable(previews, func(i, j int) bool {
+		if previews[i].start == previews[j].start {
+			return previews[i].end < previews[j].end
+		}
+		return previews[i].start < previews[j].start
+	})
+}
+
+func composerPastePreviewsAfterDelete(previews []composerPastePreview, deleteIndex int) []composerPastePreview {
+	if deleteIndex < 0 || deleteIndex >= len(previews) {
+		return previews
+	}
+	deleted := previews[deleteIndex]
+	delta := deleted.end - deleted.start
+	next := make([]composerPastePreview, 0, len(previews)-1)
+	for index, preview := range previews {
+		if index == deleteIndex {
+			continue
+		}
+		if preview.start >= deleted.end {
+			preview.start -= delta
+			preview.end -= delta
+		}
+		next = append(next, preview)
+	}
+	sortComposerPastePreviews(next)
+	return next
 }
 
 func shouldInsertCommandArgumentSpace(state composerState, text string) bool {
@@ -265,24 +580,19 @@ func shouldInsertCommandArgumentSpace(state composerState, text string) bool {
 	return commandArgumentHintForInput(state.text) != ""
 }
 
-func renderComposerState(state composerState, prompt string, width int) string {
-	state = normalizeComposerState(state)
-	lines := strings.Split(state.text, "\n")
-	for index, line := range lines {
-		prefix := "  "
-		if index == 0 {
-			prefix = prompt
-		}
-		lines[index] = fitStyledLine(prefix+line, width)
+func deleteCompletedFileMentionBefore(state composerState) (composerState, bool) {
+	start, end, ok := completedFileMentionRangeBefore(state)
+	if !ok {
+		return state, false
 	}
-	return strings.Join(lines, "\n")
+	return deleteComposerRange(state, start, end), true
 }
 
-func deleteCompletedFileMentionBefore(state composerState) (composerState, bool) {
+func completedFileMentionRangeBefore(state composerState) (int, int, bool) {
 	state = normalizeComposerState(state)
 	runes := []rune(state.text)
 	if state.cursor <= 0 || state.cursor > len(runes) || !isPathQueryBoundary(runes[state.cursor-1]) {
-		return state, false
+		return 0, 0, false
 	}
 	tokenEnd := state.cursor
 	for tokenEnd > 0 && isPathQueryBoundary(runes[tokenEnd-1]) {
@@ -293,9 +603,9 @@ func deleteCompletedFileMentionBefore(state composerState) (composerState, bool)
 		tokenStart--
 	}
 	if tokenStart >= tokenEnd || runes[tokenStart] != '@' || tokenEnd-tokenStart <= 1 {
-		return state, false
+		return 0, 0, false
 	}
-	return deleteComposerRange(state, tokenStart, state.cursor), true
+	return tokenStart, state.cursor, true
 }
 
 func deleteComposerRange(state composerState, start int, end int) composerState {

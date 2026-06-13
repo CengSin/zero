@@ -207,6 +207,43 @@ func TestStreamCompletionEmitsTextUsageAndDone(t *testing.T) {
 	}
 }
 
+func TestStreamCompletionEmitsReasoningContentDeltas(t *testing.T) {
+	provider := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w, `{"choices":[{"delta":{"reasoning_content":"Thinking. "}}]}`)
+		writeSSE(w, `{"choices":[{"delta":{"reasoning_content":"Answering now."}}]}`)
+		writeSSE(w, `[DONE]`)
+	})
+
+	events := collectProviderEvents(t, provider)
+	reasoning := eventsOfType(events, zeroruntime.StreamEventReasoning)
+	if len(reasoning) != 2 {
+		t.Fatalf("reasoning events = %#v, want two reasoning deltas", reasoning)
+	}
+	if reasoning[0].Content != "Thinking. " || reasoning[1].Content != "Answering now." {
+		t.Fatalf("unexpected reasoning events: %#v", reasoning)
+	}
+	if text := eventsOfType(events, zeroruntime.StreamEventText); len(text) != 0 {
+		t.Fatalf("reasoning_content must not emit text events, got %#v", text)
+	}
+}
+
+func TestStreamCompletionEmitsReasoningBeforeRegularContent(t *testing.T) {
+	provider := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w, `{"choices":[{"delta":{"reasoning_content":"Thinking. ","content":"Answer."}}]}`)
+		writeSSE(w, `[DONE]`)
+	})
+
+	events := collectProviderEvents(t, provider)
+	if len(events) < 3 {
+		t.Fatalf("events = %#v, want reasoning, text, done", events)
+	}
+	assertEvent(t, events[0], zeroruntime.StreamEventReasoning, "Thinking. ")
+	assertEvent(t, events[1], zeroruntime.StreamEventText, "Answer.")
+	if events[2].Type != zeroruntime.StreamEventDone {
+		t.Fatalf("third event = %#v, want done", events[2])
+	}
+}
+
 func TestStreamCompletionBuffersToolArgsUntilIDAndNameArrive(t *testing.T) {
 	provider := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
 		writeSSE(w, `{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}`)

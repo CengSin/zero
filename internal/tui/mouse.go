@@ -93,6 +93,11 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			m.moveSuggestion(-1)
 			return m, nil
 		}
+		if m.mouseOverComposer(msg) {
+			if next, ok := m.moveComposerVisualCursor(-1); ok {
+				return next, nil
+			}
+		}
 		return m.scrollChat(chatWheelScrollLines), nil
 	case mouseWheelDown(msg):
 		m.clearMouseSelection()
@@ -118,6 +123,11 @@ func (m model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if m.suggestionsActive() {
 			m.moveSuggestion(1)
 			return m, nil
+		}
+		if m.mouseOverComposer(msg) {
+			if next, ok := m.moveComposerVisualCursor(1); ok {
+				return next, nil
+			}
 		}
 		return m.scrollChat(-chatWheelScrollLines), nil
 	default:
@@ -182,6 +192,59 @@ func mouseWheelUp(msg tea.MouseMsg) bool {
 
 func mouseWheelDown(msg tea.MouseMsg) bool {
 	return msg.Button == tea.MouseButtonWheelDown || msg.Type == tea.MouseWheelDown
+}
+
+func (m model) mouseOverComposer(msg tea.MouseMsg) bool {
+	if !m.altScreen || m.height <= 0 {
+		return false
+	}
+	width := chatWidth(m.width)
+	composerLines := viewLines(m.composerBox(width))
+	fullFooterLines := viewLines(m.footerView(width))
+	if len(composerLines) == 0 || len(fullFooterLines) == 0 {
+		return false
+	}
+	composerTop := lineSequenceIndex(fullFooterLines, composerLines)
+	if composerTop < 0 {
+		return false
+	}
+	footerLines := fullFooterLines
+	clippedPrefix := 0
+	maxFooterLines := maxInt(0, m.height-1)
+	if len(footerLines) > maxFooterLines {
+		clippedPrefix = len(footerLines) - maxFooterLines
+		footerLines = footerLines[clippedPrefix:]
+	}
+	if len(footerLines) == 0 {
+		return false
+	}
+	visibleTop := maxInt(composerTop, clippedPrefix)
+	visibleBottom := minInt(composerTop+len(composerLines), clippedPrefix+len(footerLines))
+	if visibleTop >= visibleBottom {
+		return false
+	}
+	footerTop := maxInt(0, m.height-len(footerLines))
+	top := footerTop + visibleTop - clippedPrefix
+	return msg.Y >= top && msg.Y < top+visibleBottom-visibleTop
+}
+
+func lineSequenceIndex(lines []string, sequence []string) int {
+	if len(sequence) == 0 || len(sequence) > len(lines) {
+		return -1
+	}
+	for index := 0; index+len(sequence) <= len(lines); index++ {
+		matched := true
+		for offset := range sequence {
+			if lines[index+offset] != sequence[offset] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return index
+		}
+	}
+	return -1
 }
 
 func (m *model) selectSuggestionAtMouse(msg tea.MouseMsg) (mouseSelectionTarget, bool) {
