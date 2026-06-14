@@ -16,8 +16,10 @@ import (
 	zsearch "github.com/Gitlawb/zero/internal/search"
 )
 
+const doctorStatusRowID = "doctor/status"
+
 func (m model) startDoctorCommand(args string) (model, tea.Cmd) {
-	connectivity, help, err := parseDoctorCommandArgs(args)
+	connectivity, fix, help, err := parseDoctorCommandArgs(args)
 	if err != nil {
 		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: doctorUsageText(commandStatusBlocked, err.Error())})
 		return m, nil
@@ -26,18 +28,42 @@ func (m model) startDoctorCommand(args string) (model, tea.Cmd) {
 		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: doctorUsageText(commandStatusInfo, "Show local diagnostics for provider, model, sandbox, LSP, and backend setup.")})
 		return m, nil
 	}
+	if fix {
+		return m.startDoctorFixCommand()
+	}
 	if !connectivity {
-		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: m.doctorText(false)})
+		m = m.setDoctorStatusRow(m.doctorText(false))
 		return m, nil
 	}
 
 	m.doctorCommandSeq++
 	id := m.doctorCommandSeq
 	snapshot := m
-	m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: doctorConnectivityRunningText()})
-	return m, func() tea.Msg {
+	m.doctorInFlight = true
+	m.doctorFrame = 0
+	m = m.setDoctorStatusRow(m.doctorConnectivityRunningText())
+	return m, tea.Batch(func() tea.Msg {
 		return doctorCommandResultMsg{id: id, text: snapshot.doctorText(true)}
+	}, m.spinner.Tick)
+}
+
+func (m model) startDoctorFixCommand() (model, tea.Cmd) {
+	report := doctor.Run(m.doctorOptions(false))
+	if doctorReportNeedsProviderSetup(report) {
+		if m.pending {
+			m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: doctorFixBusyText()})
+			return m, nil
+		}
+		m.providerWizard = m.newProviderWizard()
+		m.clearSuggestions()
+		m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: doctorFixProviderSetupText()})
+		return m, nil
 	}
+	if doctorReportCanProbeConnectivity(report) {
+		return m.startDoctorCommand("--connectivity")
+	}
+	m.transcript = reduceTranscript(m.transcript, transcriptAction{kind: actionAppendSystem, text: doctorFixPlanText(report)})
+	return m, nil
 }
 
 func (m model) doctorText(connectivity bool) string {
@@ -45,18 +71,37 @@ func (m model) doctorText(connectivity bool) string {
 	return renderCommandOutput(doctorCommandOutput(report, nil))
 }
 
-func parseDoctorCommandArgs(args string) (connectivity bool, help bool, err error) {
+func parseDoctorCommandArgs(args string) (connectivity bool, fix bool, help bool, err error) {
 	for _, field := range strings.Fields(args) {
 		switch strings.ToLower(field) {
 		case "--connectivity", "connectivity":
 			connectivity = true
+		case "--fix", "fix":
+			fix = true
 		case "-h", "--help", "help":
 			help = true
 		default:
-			return false, false, fmt.Errorf("unknown doctor flag %q", field)
+			return false, false, false, fmt.Errorf("unknown doctor flag %q", field)
 		}
 	}
-	return connectivity, help, nil
+	if connectivity && fix {
+		return false, false, false, fmt.Errorf("choose either %q or %q, not both", "fix", "--connectivity")
+	}
+	return connectivity, fix, help, nil
+}
+
+func doctorReportNeedsProviderSetup(report doctor.Report) bool {
+	for _, id := range []string{"provider.config", "provider.model"} {
+		if check := report.Check(id); check != nil && check.Status == doctor.StatusFail {
+			return true
+		}
+	}
+	return false
+}
+
+func doctorReportCanProbeConnectivity(report doctor.Report) bool {
+	check := report.Check("provider.connectivity")
+	return check != nil && check.Status != doctor.StatusPass
 }
 
 func doctorUsageText(status commandStatus, message string) string {
@@ -68,6 +113,7 @@ func doctorUsageText(status commandStatus, message string) string {
 			Lines: []string{
 				message,
 				"/doctor",
+				"/doctor fix",
 				"/doctor --connectivity",
 				"/health",
 			},
@@ -75,16 +121,95 @@ func doctorUsageText(status commandStatus, message string) string {
 	})
 }
 
-func doctorConnectivityRunningText() string {
+func doctorFixProviderSetupText() string {
 	return renderCommandOutput(commandOutput{
-		Title:  "Diagnostics",
+		Title:  "Diagnostics fix",
 		Status: commandStatusInfo,
 		Sections: []commandSection{{
 			Title: "Provider",
-			Lines: []string{"checking provider connectivity..."},
+			Lines: []string{"Opening provider setup. Choose a provider, add credentials, then select a model."},
 		}},
-		Hints: []string{"keep typing; Zero will append the result when the probe finishes"},
+		Hints: []string{"Esc closes setup"},
 	})
+}
+
+func doctorFixBusyText() string {
+	return renderCommandOutput(commandOutput{
+		Title:  "Diagnostics fix",
+		Status: commandStatusWarning,
+		Sections: []commandSection{{
+			Title: "Provider",
+			Lines: []string{"Cannot open provider setup while a run is active."},
+		}},
+		Hints: []string{"stop the current run, then retry /doctor fix"},
+	})
+}
+
+func doctorFixPlanText(report doctor.Report) string {
+	return renderCommandOutput(commandOutput{
+		Title:  "Diagnostics fix",
+		Status: doctorCommandStatus(report),
+		Sections: []commandSection{{
+			Title: "Next actions",
+			Lines: doctorFixLines(report),
+		}},
+		Hints: []string{"run /doctor --connectivity to recheck provider health"},
+	})
+}
+
+func doctorFixLines(report doctor.Report) []string {
+	lines := []string{}
+	hasIssue := false
+	for _, check := range report.Checks {
+		if check.Status == doctor.StatusPass {
+			continue
+		}
+		hasIssue = true
+		switch check.ID {
+		case "sandbox.backend":
+			lines = append(lines, "native sandbox: use WSL2 or a Linux container on Windows")
+		case "lsp.servers":
+			lines = append(lines, "language servers: install missing LSP binaries on PATH")
+		case "provider.connectivity":
+			lines = append(lines, "provider connectivity: run /doctor --connectivity")
+		case "config.files", "config.validation":
+			lines = append(lines, "config: run /provider to create or repair provider config")
+		}
+	}
+	if len(lines) == 0 {
+		if hasIssue {
+			return []string{"No automatic fixes are available for the detected diagnostics."}
+		}
+		return []string{"No automatic fixes are available because diagnostics are already clean."}
+	}
+	return lines
+}
+
+func (m model) doctorConnectivityRunningText() string {
+	return strings.Join([]string{
+		"Checking provider",
+		"Zero is probing the active endpoint. Keep typing; messages will queue until the check finishes.",
+		m.doctorAnimationLine(),
+		"provider: " + displayValue(m.providerName, displayValue(m.providerProfile.Name, "unknown")),
+		"model: " + displayValue(m.modelName, displayValue(m.providerProfile.Model, "unknown")),
+	}, "\n")
+}
+
+func (m model) doctorAnimationLine() string {
+	frame := compactFrames[m.doctorFrame%len(compactFrames)]
+	return frame + " checking provider connectivity..."
+}
+
+func (m model) setDoctorStatusRow(text string) model {
+	row := transcriptRow{kind: rowSystem, id: doctorStatusRowID, tool: "doctor", text: text}
+	for i := len(m.transcript) - 1; i >= 0; i-- {
+		if m.transcript[i].id == doctorStatusRowID {
+			m.transcript[i] = row
+			return m
+		}
+	}
+	m.transcript = appendTranscriptRow(m.transcript, row)
+	return m
 }
 
 func (m model) searchText(query string) string {

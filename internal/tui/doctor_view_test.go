@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -50,6 +51,39 @@ func TestDoctorCommandOutputMapsOverallStatus(t *testing.T) {
 	}
 }
 
+func TestDoctorSummaryLinesUseSingularGrammar(t *testing.T) {
+	healthy := doctorSummaryLines([]doctor.Check{
+		doctorCheck("runtime.go", doctor.StatusPass, "Go runtime is available."),
+	})
+	if got, want := healthy[0], "1 check healthy"; got != want {
+		t.Fatalf("healthy summary = %q, want %q", got, want)
+	}
+
+	attention := doctorSummaryLines([]doctor.Check{
+		doctorCheck("provider.model", doctor.StatusWarn, "Provider model is not configured."),
+	})
+	if got, want := attention[0], "1 check needs attention"; got != want {
+		t.Fatalf("attention summary = %q, want %q", got, want)
+	}
+}
+
+func TestDoctorResultBorderStyleUsesSummaryStatusLine(t *testing.T) {
+	text := strings.Join([]string{
+		"Diagnostics",
+		"",
+		"status: blocked",
+		"",
+		"Summary",
+		"- status: ok appears in detail text only",
+	}, "\n")
+
+	got := fmt.Sprint(doctorResultBorderStyle(text).GetForeground())
+	want := fmt.Sprint(zeroTheme.red.GetForeground())
+	if got != want {
+		t.Fatalf("border foreground = %s, want blocked red %s", got, want)
+	}
+}
+
 func TestDoctorCommandOutputGroupsProviderAndPlatformChecks(t *testing.T) {
 	output := doctorCommandOutput(doctor.Report{Checks: []doctor.Check{
 		doctorCheck("provider.config", doctor.StatusPass, "Provider config loaded."),
@@ -64,13 +98,52 @@ func TestDoctorCommandOutputGroupsProviderAndPlatformChecks(t *testing.T) {
 	if provider == nil {
 		t.Fatalf("missing Provider section: %#v", output.Sections)
 	}
-	assertRowsContain(t, provider.Rows, "provider.config", "provider.model", "provider.connectivity")
+	assertRowsContain(t, provider.Rows, "provider.model", "provider.connectivity")
+	assertRowsDoNotContain(t, provider.Rows, "provider.config")
 
 	platform := doctorSection(output, "Platform")
 	if platform == nil {
 		t.Fatalf("missing Platform section: %#v", output.Sections)
 	}
-	assertRowsContain(t, platform.Rows, "sandbox.backend", "runtime.go", "config.files")
+	assertRowsContain(t, platform.Rows, "sandbox.backend")
+	assertRowsDoNotContain(t, platform.Rows, "runtime.go", "config.files")
+}
+
+func TestDoctorCommandOutputIsProblemFirstDiagnosticCenter(t *testing.T) {
+	output := doctorCommandOutput(doctor.Report{GeneratedAt: "2026-06-14T00:00:00Z", Checks: []doctor.Check{
+		doctorCheck("provider.config", doctor.StatusPass, "Provider config loaded."),
+		doctorCheck("provider.model", doctor.StatusWarn, "Provider model is not configured."),
+		doctorCheck("provider.connectivity", doctor.StatusWarn, "Connectivity probe skipped."),
+		doctorCheck("runtime.go", doctor.StatusPass, "Zero Go runtime is available."),
+		doctorCheck("config.files", doctor.StatusPass, "Zero config files are available."),
+		doctorCheck("lsp.servers", doctor.StatusWarn, "2 language server(s) missing from PATH."),
+	}}, nil)
+
+	text := formatCommandOutput(output)
+	for _, want := range []string{
+		"3 checks need attention",
+		"3 checks healthy",
+		"provider.model",
+		"provider.connectivity",
+		"lsp.servers",
+		"Actions",
+		"/doctor fix",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("formatted output missing %q:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{
+		"Generated",
+		"Checks",
+		"provider.config",
+		"runtime.go",
+		"config.files",
+	} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("formatted output should hide %q:\n%s", unwanted, text)
+		}
+	}
 }
 
 func TestDoctorCommandOutputAddsActionableHints(t *testing.T) {
@@ -160,6 +233,19 @@ func assertRowsContain(t *testing.T, rows []commandRow, wants ...string) {
 	for _, want := range wants {
 		if !strings.Contains(text, want) {
 			t.Fatalf("rows missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func assertRowsDoNotContain(t *testing.T, rows []commandRow, wants ...string) {
+	t.Helper()
+	text := ""
+	for _, row := range rows {
+		text += row.Text + "\n"
+	}
+	for _, want := range wants {
+		if strings.Contains(text, want) {
+			t.Fatalf("rows unexpectedly contain %q:\n%s", want, text)
 		}
 	}
 }

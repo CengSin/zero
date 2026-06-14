@@ -210,6 +210,12 @@ func (m model) renderRowModeUncached(row transcriptRow, width int, rc rowContext
 		if row.id == compactStatusRowID && strings.HasPrefix(strings.TrimSpace(row.text), "Compression complete") {
 			return renderCompactCompleteCard(row.text, width)
 		}
+		if row.id == doctorStatusRowID && strings.HasPrefix(strings.TrimSpace(row.text), "Checking provider") {
+			return renderDoctorRunningCard(row.text, width)
+		}
+		if row.id == doctorStatusRowID {
+			return renderDoctorResultCard(row.text, width)
+		}
 		return renderSystemNote(row.text, width)
 	case rowError:
 		return renderErrorRow(row, width)
@@ -493,6 +499,85 @@ func renderCompactCompleteCard(text string, width int) string {
 		}
 	}
 	return styledBlock(width, lines, zeroTheme.green)
+}
+
+func renderDoctorRunningCard(text string, width int) string {
+	raw := strings.Split(strings.TrimRight(strings.ReplaceAll(text, "\r\n", "\n"), "\n"), "\n")
+	lines := make([]string, 0, len(raw)+1)
+	for index, line := range raw {
+		switch index {
+		case 0:
+			lines = append(lines, zeroTheme.accent.Bold(true).Render(line))
+		case 1:
+			lines = append(lines, zeroTheme.muted.Render(line))
+		case 2:
+			lines = append(lines, zeroTheme.accent.Bold(true).Render(line))
+		default:
+			lines = append(lines, zeroTheme.faint.Render(line))
+		}
+		if index == 0 {
+			lines = append(lines, "")
+		}
+	}
+	return styledBlock(width, lines, zeroTheme.accent)
+}
+
+func renderDoctorResultCard(text string, width int) string {
+	raw := strings.Split(strings.TrimRight(strings.ReplaceAll(text, "\r\n", "\n"), "\n"), "\n")
+	border := doctorResultBorderStyle(text)
+	lines := make([]string, 0, len(raw))
+	for index, line := range raw {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case index == 0:
+			lines = append(lines, border.Bold(true).Render(line))
+		case strings.HasPrefix(trimmed, "status:"):
+			lines = append(lines, border.Render(line))
+		case isDoctorResultHeading(trimmed):
+			lines = append(lines, zeroTheme.accent.Bold(true).Render(line))
+		case strings.HasPrefix(trimmed, "- [pass]"):
+			lines = append(lines, zeroTheme.green.Render(line))
+		case strings.HasPrefix(trimmed, "- [warn]"):
+			lines = append(lines, zeroTheme.amber.Render(line))
+		case strings.HasPrefix(trimmed, "- [fail]"):
+			lines = append(lines, zeroTheme.red.Render(line))
+		case strings.HasPrefix(trimmed, "hint:"):
+			lines = append(lines, zeroTheme.faint.Render(line))
+		case strings.HasPrefix(trimmed, "/") ||
+			strings.HasPrefix(trimmed, "WSL2") ||
+			strings.HasPrefix(trimmed, "install "):
+			lines = append(lines, zeroTheme.ink.Render(line))
+		default:
+			lines = append(lines, zeroTheme.muted.Render(line))
+		}
+		if index == 0 {
+			lines = append(lines, "")
+		}
+	}
+	return styledBlock(width, lines, border)
+}
+
+func doctorResultBorderStyle(text string) lipgloss.Style {
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		switch strings.TrimSpace(line) {
+		case "status: ok":
+			return zeroTheme.green
+		case "status: blocked":
+			return zeroTheme.red
+		case "status: warning":
+			return zeroTheme.amber
+		}
+	}
+	return zeroTheme.accent
+}
+
+func isDoctorResultHeading(value string) bool {
+	switch value {
+	case "Summary", "Provider", "Platform", "Other", "Backend", "Actions":
+		return true
+	default:
+		return false
+	}
 }
 
 func renderErrorRow(row transcriptRow, width int) string {
