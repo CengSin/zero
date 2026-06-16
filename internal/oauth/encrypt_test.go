@@ -108,6 +108,30 @@ func newEncryptedStore(t *testing.T) (*Store, string) {
 	return s, path
 }
 
+// The unified Storage="encrypted-file" selector must encrypt at rest, the same as
+// the legacy Encrypted:true alias (the file/keyring/encrypted-file merge).
+func TestNewStoreEncryptedFileStorageSelector(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oauth-tokens.json")
+	s, err := NewStore(StoreOptions{FilePath: path, Storage: "encrypted-file"})
+	if err != nil {
+		t.Fatalf("NewStore(encrypted-file): %v", err)
+	}
+	if err := s.Save(ProviderKey("demo"), Token{AccessToken: "super-secret-access"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if strings.Contains(string(raw), "super-secret-access") || strings.Contains(string(raw), "schemaVersion") {
+		t.Fatalf("Storage=encrypted-file did not encrypt at rest:\n%s", raw)
+	}
+	got, ok, err := s.Load(ProviderKey("demo"))
+	if err != nil || !ok || got.AccessToken != "super-secret-access" {
+		t.Fatalf("Load = %+v ok=%v err=%v", got, ok, err)
+	}
+}
+
 func TestEncryptedStoreRoundTripAndCiphertextOnDisk(t *testing.T) {
 	s, path := newEncryptedStore(t)
 	tok := Token{AccessToken: "super-secret-access", RefreshToken: "super-secret-refresh", Account: "me@x"}

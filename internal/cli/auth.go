@@ -129,19 +129,18 @@ func validateAuthFlags(sub string, a authArgs) error {
 // ZERO_OAUTH_STORAGE=encrypted-file selects the AES-256-GCM encrypted-at-rest
 // backend (a per-user secret is created beside the token file).
 func newAuthManager(deps appDeps, out io.Writer) (*oauth.Manager, error) {
-	// Validate ZERO_OAUTH_STORAGE up front: a mistyped non-empty value must fail
-	// fast rather than silently fall back to plaintext while the user believes
-	// encryption is on. Empty = default (plaintext 0600); "encrypted-file" = AES.
-	encrypted := false
-	if mode := strings.TrimSpace(os.Getenv("ZERO_OAUTH_STORAGE")); mode != "" {
-		if !strings.EqualFold(mode, "encrypted-file") {
-			return nil, fmt.Errorf("invalid ZERO_OAUTH_STORAGE %q (supported: encrypted-file)", mode)
-		}
-		encrypted = true
+	// Validate ZERO_OAUTH_STORAGE up front: a mistyped value must fail fast rather
+	// than silently change the backend. Empty = default (plaintext 0600 file);
+	// "encrypted-file" = AES-256-GCM; "keyring" = the OS keyring.
+	storage := strings.ToLower(strings.TrimSpace(os.Getenv("ZERO_OAUTH_STORAGE")))
+	switch storage {
+	case "", "file", "encrypted-file", "keyring":
+	default:
+		return nil, fmt.Errorf("invalid ZERO_OAUTH_STORAGE %q (supported: file, encrypted-file, keyring)", storage)
 	}
 	store, err := oauth.NewStore(oauth.StoreOptions{
-		Now:       deps.now,
-		Encrypted: encrypted,
+		Now:     deps.now,
+		Storage: storage,
 	})
 	if err != nil {
 		return nil, err
@@ -350,8 +349,10 @@ built in). For a provider named <name>, set:
 Endpoint URLs must be https (loopback exempt).
 
 Storage: tokens are written 0600 under $XDG_CONFIG_HOME/zero (override with
-ZERO_OAUTH_TOKENS_PATH). Set ZERO_OAUTH_STORAGE=encrypted-file to encrypt them
-at rest with AES-256-GCM (a per-user secret is created beside the token file).
+ZERO_OAUTH_TOKENS_PATH). Set ZERO_OAUTH_STORAGE=encrypted-file to encrypt them at
+rest with AES-256-GCM (a per-user secret beside the file), or
+ZERO_OAUTH_STORAGE=keyring to use the OS keyring (macOS Keychain / Linux
+secret-tool). MCP server tokens share the same store.
 
 Flags:
       --device   Use the device-code flow (headless/SSH; no browser)
