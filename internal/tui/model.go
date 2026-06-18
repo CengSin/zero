@@ -324,6 +324,7 @@ type permissionDecision = agent.PermissionDecisionAction
 
 const (
 	permissionDecisionAllow           permissionDecision = agent.PermissionDecisionAllow
+	permissionDecisionAllowStrict     permissionDecision = agent.PermissionDecisionAllowStrict
 	permissionDecisionAllowForSession permissionDecision = agent.PermissionDecisionAllowForSession
 	permissionDecisionDeny            permissionDecision = agent.PermissionDecisionDeny
 	permissionDecisionAlwaysAllow     permissionDecision = agent.PermissionDecisionAlwaysAllow
@@ -721,6 +722,9 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.pendingSpecReview != nil {
 				return m.cancelSpecReview()
+			}
+			if m.pendingPermission != nil && m.pendingPermission.request.ToolName == tools.RequestPermissionsToolName {
+				return m.resolvePermission(permissionDecisionDeny)
 			}
 			if m.providerWizard != nil {
 				m.providerWizard = nil
@@ -2275,6 +2279,8 @@ func permissionDecisionReason(decision permissionDecision) string {
 	switch decision {
 	case permissionDecisionAllow:
 		return "approved in TUI"
+	case permissionDecisionAllowStrict:
+		return "approved with model review request in TUI"
 	case permissionDecisionAllowForSession:
 		return "approved for this session in TUI"
 	case permissionDecisionAlwaysAllow:
