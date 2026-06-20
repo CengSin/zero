@@ -595,10 +595,22 @@ type thinkingBuf struct {
 // normalized terminal reasons. A normal stop ("end_turn"/"tool_use"/"stop_sequence"/"")
 // returns "".
 func mapStopReason(reason string) string {
-	if reason == "max_tokens" {
+	switch reason {
+	case "max_tokens":
 		return zeroruntime.FinishReasonLength
+	case "refusal":
+		// The model declined to respond — surface it as content-filtered so the
+		// empty/partial turn isn't mistaken for a normal completion (M4).
+		return zeroruntime.FinishReasonContentFilter
+	default:
+		// end_turn / tool_use / stop_sequence (and "") are normal completions.
+		// pause_turn is also normal here: it is Anthropic's long-running-turn pause
+		// (used with server-side tools), where the turn is NOT truncated or refused —
+		// the client is expected to resume it by sending the response back. Treating
+		// it as a non-normal early stop would fire a spurious truncation notice, so it
+		// maps to "" like the other clean stops.
+		return ""
 	}
-	return ""
 }
 
 func newStreamState() *streamState {

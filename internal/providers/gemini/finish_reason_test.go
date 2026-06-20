@@ -7,6 +7,31 @@ import (
 	"github.com/Gitlawb/zero/internal/zeroruntime"
 )
 
+// TestMapFinishReasonNonNormal unit-tests the reason mapping in isolation: the
+// normal set collapses to "", content-filter reasons map to content_filter,
+// MAX_TOKENS to length, and every other non-STOP reason surfaces its raw value
+// (M3) so the turn is not mistaken for a clean completion.
+func TestMapFinishReasonNonNormal(t *testing.T) {
+	for _, normal := range []string{"", "STOP", "FINISH_REASON_UNSPECIFIED"} {
+		if got := mapFinishReason(normal); got != "" {
+			t.Errorf("%q should be a normal stop (empty), got %q", normal, got)
+		}
+	}
+	for _, cf := range []string{"SAFETY", "RECITATION", "IMAGE_SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"} {
+		if got := mapFinishReason(cf); got != zeroruntime.FinishReasonContentFilter {
+			t.Errorf("%q → %q, want content_filter (M3)", cf, got)
+		}
+	}
+	if got := mapFinishReason("MAX_TOKENS"); got != zeroruntime.FinishReasonLength {
+		t.Errorf("MAX_TOKENS → %q, want length", got)
+	}
+	// Remaining non-STOP reasons surface the raw reason (non-empty) so the turn is
+	// not mistaken for a clean completion.
+	if got := mapFinishReason("MALFORMED_FUNCTION_CALL"); got != "MALFORMED_FUNCTION_CALL" {
+		t.Errorf("MALFORMED_FUNCTION_CALL → %q, want the raw reason", got)
+	}
+}
+
 // A candidate finishReason of MAX_TOKENS means the response was truncated at the
 // output cap. The provider must surface it on the done event.
 func TestStreamCompletionSurfacesMaxTokensFinishReason(t *testing.T) {
@@ -44,6 +69,29 @@ func TestStreamCompletionSurfacesSafetyFinishReason(t *testing.T) {
 			sawDone = true
 			if e.FinishReason != zeroruntime.FinishReasonContentFilter {
 				t.Fatalf("done FinishReason = %q, want %q", e.FinishReason, zeroruntime.FinishReasonContentFilter)
+			}
+		}
+	}
+	if !sawDone {
+		t.Fatalf("no done event; events: %+v", events)
+	}
+}
+
+// A RECITATION finishReason previously fell through to "" (a clean completion);
+// M3 maps it to content_filter. This exercises that fix through the full
+// SSE → done-event wiring, not just mapFinishReason in isolation.
+func TestStreamCompletionSurfacesRecitationFinishReason(t *testing.T) {
+	provider := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w, `{"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"RECITATION"}]}`)
+	})
+
+	events := collectProviderEvents(t, provider)
+	var sawDone bool
+	for _, e := range events {
+		if e.Type == zeroruntime.StreamEventDone {
+			sawDone = true
+			if e.FinishReason != zeroruntime.FinishReasonContentFilter {
+				t.Fatalf("RECITATION done FinishReason = %q, want %q (M3)", e.FinishReason, zeroruntime.FinishReasonContentFilter)
 			}
 		}
 	}
