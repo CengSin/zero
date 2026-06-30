@@ -385,6 +385,14 @@ func sendBufferedEvent(events chan<- zeroruntime.StreamEvent, event zeroruntime.
 func (provider *Provider) openAIRequest(request zeroruntime.CompletionRequest) chatCompletionRequest {
 	messages := make([]chatMessage, 0, len(request.Messages))
 	for _, message := range request.Messages {
+		// Drop a degenerate assistant turn that carries neither text nor tool calls
+		// (e.g. a sub-agent that failed with no output). The Anthropic/Gemini mappers
+		// already skip empty turns; without this, the contentless message reaches
+		// strict OpenAI-compatible servers and is rejected.
+		if message.Role == zeroruntime.MessageRoleAssistant &&
+			strings.TrimSpace(message.Content) == "" && len(message.ToolCalls) == 0 {
+			continue
+		}
 		messages = append(messages, mapMessage(message))
 	}
 
@@ -445,11 +453,12 @@ func mapMessage(message zeroruntime.Message) chatMessage {
 	// message that happens to carry Images keeps the plain string/nil content
 	// path (its images are simply not serialized).
 	if len(message.Images) == 0 || message.Role != zeroruntime.MessageRoleUser {
-		// Preserve the legacy behavior: only non-empty text is serialized, so
-		// empty content is omitted by the `omitempty` tag.
-		if message.Content != "" {
-			mapped.Content = message.Content
-		}
+		// Always set content (to "" when empty) so it serializes as `"content":""`
+		// rather than being dropped. Strict OpenAI-compatible servers reject a
+		// message with no content field; tool results and assistant-with-tool-calls
+		// turns must still carry an (empty) content. Truly empty assistant turns are
+		// dropped upstream in openAIRequest.
+		mapped.Content = message.Content
 	} else {
 		parts := make([]contentPart, 0, len(message.Images)+1)
 		if message.Content != "" {

@@ -18,8 +18,13 @@ type streamOptions struct {
 }
 
 type chatMessage struct {
-	Role       string            `json:"role"`
-	Content    any               `json:"content,omitempty"`
+	Role string `json:"role"`
+	// Content has no omitempty: strict OpenAI-compatible servers (e.g. some
+	// Ollama-cloud models like glm-*) reject a message whose `content` is absent
+	// or null with "invalid message content type: <nil>". mapMessage always sets
+	// this (to "" when there's no text), so a contentless message serializes as
+	// `"content":""` rather than being dropped.
+	Content    any               `json:"content"`
 	ToolCalls  []requestToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string            `json:"tool_call_id,omitempty"`
 }

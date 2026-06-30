@@ -1000,57 +1000,6 @@ func TestStreamCompletionEmitsDroppedOnNamelessToolCall(t *testing.T) {
 	}
 }
 
-func TestOpenAIRequestTextOnlyOmitsEmptyContent(t *testing.T) {
-	provider, err := New(Options{Model: "gpt-test"})
-	if err != nil {
-		t.Fatalf("New returned error: %v", err)
-	}
-
-	got, err := json.Marshal(provider.openAIRequest(zeroruntime.CompletionRequest{
-		Messages: []zeroruntime.Message{
-			{Role: zeroruntime.MessageRoleSystem, Content: "system"},
-			{Role: zeroruntime.MessageRoleUser, Content: "hello"},
-			{
-				Role:    zeroruntime.MessageRoleAssistant,
-				Content: "", // assistant turn that is *only* a tool call -> empty content must drop
-				ToolCalls: []zeroruntime.ToolCall{{
-					ID:        "call_1",
-					Name:      "read_file",
-					Arguments: `{"path":"README.md"}`,
-				}},
-			},
-			{Role: zeroruntime.MessageRoleTool, Content: "contents", ToolCallID: "call_1"},
-		},
-	}))
-	if err != nil {
-		t.Fatalf("marshal request: %v", err)
-	}
-
-	// String content round-trips as a JSON string, and empty content is omitted.
-	if !strings.Contains(string(got), `"content":"hello"`) {
-		t.Fatalf("user content not serialized as string: %s", got)
-	}
-	if strings.Contains(string(got), `"content":""`) {
-		t.Fatalf("empty assistant content must be omitted, got: %s", got)
-	}
-
-	// Decode the assistant message and assert no content key at all.
-	var decoded chatCompletionRequest
-	var raw struct {
-		Messages []map[string]any `json:"messages"`
-	}
-	if err := json.Unmarshal(got, &raw); err != nil {
-		t.Fatalf("unmarshal request: %v", err)
-	}
-	_ = decoded
-	if _, present := raw.Messages[2]["content"]; present {
-		t.Fatalf("assistant (tool-only) message must omit content key, got: %#v", raw.Messages[2])
-	}
-	if raw.Messages[1]["content"] != "hello" {
-		t.Fatalf("user content = %#v, want \"hello\"", raw.Messages[1]["content"])
-	}
-}
-
 func TestContentPartImageURLMarshalsDataURI(t *testing.T) {
 	parts := []contentPart{
 		{Type: "text", Text: "look"},
@@ -1073,38 +1022,6 @@ func TestContentPartImageURLMarshalsDataURI(t *testing.T) {
 	textOnly, _ := json.Marshal(contentPart{Type: "text", Text: "hi"})
 	if strings.Contains(string(textOnly), `"image_url"`) {
 		t.Fatalf("text part must omit nil image_url, got: %s", textOnly)
-	}
-}
-
-func TestOpenAIRequestEmptyContentStaysOmittedAfterAnyRefactor(t *testing.T) {
-	provider, err := New(Options{Model: "gpt-test"})
-	if err != nil {
-		t.Fatalf("New returned error: %v", err)
-	}
-	got, err := json.Marshal(provider.openAIRequest(zeroruntime.CompletionRequest{
-		Messages: []zeroruntime.Message{
-			{
-				Role:    zeroruntime.MessageRoleAssistant,
-				Content: "",
-				ToolCalls: []zeroruntime.ToolCall{{
-					ID:        "call_1",
-					Name:      "read_file",
-					Arguments: `{}`,
-				}},
-			},
-		},
-	}))
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	var raw struct {
-		Messages []map[string]any `json:"messages"`
-	}
-	if err := json.Unmarshal(got, &raw); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if _, present := raw.Messages[0]["content"]; present {
-		t.Fatalf("empty content boxed in any must stay omitted, got: %#v", raw.Messages[0])
 	}
 }
 
@@ -1165,8 +1082,8 @@ func TestMapMessageTextOnlyKeepsStringContent(t *testing.T) {
 		t.Fatalf("Content = %#v, want string \"hi\"", msg.Content)
 	}
 	empty := mapMessage(zeroruntime.Message{Role: zeroruntime.MessageRoleAssistant, Content: ""})
-	if empty.Content != nil {
-		t.Fatalf("empty text content = %#v, want nil so omitempty drops it", empty.Content)
+	if got, ok := empty.Content.(string); !ok || got != "" {
+		t.Fatalf("empty text content = %#v, want \"\" so it serializes as content:\"\" (strict servers reject a missing/null content)", empty.Content)
 	}
 }
 
@@ -1244,5 +1161,68 @@ func TestStreamCompletionSerializesImageContentParts(t *testing.T) {
 	imageURL := imagePart["image_url"].(map[string]any)
 	if imageURL["url"] != "data:image/png;base64,QUJD" {
 		t.Fatalf("image url = %#v, want data:image/png;base64,QUJD", imageURL["url"])
+	}
+}
+
+// TestOpenAIRequestEmptyContentHandling locks in the fix for strict OpenAI-
+// compatible servers (e.g. glm-* on Ollama-cloud) that reject a message whose
+// `content` is absent/null with "invalid message content type: <nil>": a
+// contentless assistant turn with no tool calls is dropped, and every other
+// message serializes an explicit `"content"` field (empty string when there is
+// no text) instead of omitting it.
+func TestOpenAIRequestEmptyContentHandling(t *testing.T) {
+	provider, err := New(Options{Model: "gpt-test"})
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	req := provider.openAIRequest(zeroruntime.CompletionRequest{
+		Messages: []zeroruntime.Message{
+			{Role: zeroruntime.MessageRoleUser, Content: "hi"},
+			// Degenerate empty assistant turn (e.g. a sub-agent that failed with no
+			// output): must be dropped, not sent.
+			{Role: zeroruntime.MessageRoleAssistant, Content: "   "},
+			// Assistant with tool calls but no text: kept, content present as "".
+			{Role: zeroruntime.MessageRoleAssistant, Content: "", ToolCalls: []zeroruntime.ToolCall{{
+				ID: "call_1", Name: "read_file", Arguments: "{}",
+			}}},
+			// Tool result with empty content: kept, content present as "".
+			{Role: zeroruntime.MessageRoleTool, Content: "", ToolCallID: "call_1"},
+		},
+	})
+
+	if len(req.Messages) != 3 {
+		t.Fatalf("empty assistant turn should be dropped; got %d messages: %#v", len(req.Messages), req.Messages)
+	}
+
+	// No message may serialize with an absent/null content field.
+	for i, message := range req.Messages {
+		if message.Content == nil {
+			t.Fatalf("message %d has nil content (would serialize as null/omitted): %#v", i, message)
+		}
+		data, err := json.Marshal(message)
+		if err != nil {
+			t.Fatalf("marshal message %d: %v", i, err)
+		}
+		if !strings.Contains(string(data), `"content":`) {
+			t.Fatalf("message %d omits the content field: %s", i, data)
+		}
+	}
+
+	if req.Messages[0].Content != "hi" {
+		t.Fatalf("user content = %#v, want \"hi\"", req.Messages[0].Content)
+	}
+	// The kept-but-textless messages must send content as an explicit empty string.
+	for _, idx := range []int{1, 2} {
+		data, err := json.Marshal(req.Messages[idx])
+		if err != nil {
+			t.Fatalf("marshal message %d: %v", idx, err)
+		}
+		if !strings.Contains(string(data), `"content":""`) {
+			t.Fatalf("message %d should send content:\"\", got %s", idx, data)
+		}
+	}
+	if len(req.Messages[1].ToolCalls) != 1 {
+		t.Fatalf("assistant tool calls dropped: %#v", req.Messages[1])
 	}
 }
