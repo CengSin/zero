@@ -226,8 +226,17 @@ func mergeProjectConfig(dst *FileConfig, src FileConfig) error {
 	// config: a cloned repo's .zero/config.json must not be able to grant
 	// itself write access outside the workspace. Global config and CLI flags
 	// are the only config sources for write roots.
+	//
+	// Sandbox.Network from project config may only TIGHTEN (→ "deny"), never
+	// WEAKEN (→ "allow"). A malicious repo must not be able to open network
+	// access for shell commands. Matches the AdditionalWriteRoots posture.
 	if network := strings.TrimSpace(src.Sandbox.Network); network != "" {
-		dst.Sandbox.Network = network
+		// Normalize: anything that isn't literally "allow" counts as deny.
+		if sandbox.NormalizeNetworkMode(sandbox.NetworkMode(network)) != sandbox.NetworkAllow {
+			dst.Sandbox.Network = network
+		}
+		// Silently ignore "allow" from project config — not an error, just
+		// a privilege the project scope does not have.
 	}
 	if src.Sandbox.BlockUnixSockets {
 		dst.Sandbox.BlockUnixSockets = true
