@@ -211,6 +211,22 @@ type model struct {
 	// sidebar; when set, the chat reflows to full width. Distinct from the
 	// availability conditions in sidebarAvailable (geometry / mode / overlays).
 	sidebarHidden bool
+	// selectedFile is the touched file selected by clicking its FILES sidebar
+	// row: its edit cards tint in the chat (rowTouchesSelectedFile) and a second
+	// click opens the drill-in file view. "" when nothing is selected; Esc clears.
+	selectedFile string
+	// fileView is the drill-in view for a touched file (file_view.go): while
+	// active the chat column's body shows the file's diff/content instead of the
+	// transcript, mirroring the subchat drill-in.
+	fileView fileViewState
+	// Git-sweep state (files_git_sweep.go): the startup snapshot of already-dirty
+	// paths (nil until Init's sweep answers), the newly dirty files discovered by
+	// live sweeps (bash/subagent mutations that carry no changedFiles), the
+	// single-flight guard, and the "not a git repo / no git" latch.
+	gitFileBaseline     map[string]bool
+	gitTouched          []gitSweepFile
+	gitSweepInFlight    bool
+	gitSweepUnavailable bool
 	// swarmDoneAt records when each swarm member was first seen finished (done/
 	// failed) in a swarm_status report, so the sidebar can linger it briefly with a
 	// fading ✓ before dropping it (a smooth exit, not an abrupt pop). Stamped in the
@@ -803,6 +819,12 @@ func (m model) Init() tea.Cmd {
 	// terminal's unprompted push — mirrors the RequestBackgroundColor request
 	// below for the same reason.
 	cmds = append(cmds, tea.RequestWindowSize)
+	// Baseline git snapshot for the FILES sidebar sweep: whatever is already
+	// dirty when the TUI opens is pre-existing state, not this session's work
+	// (files_git_sweep.go). Async; a non-git workspace just disables the sweep.
+	if strings.TrimSpace(m.cwd) != "" {
+		cmds = append(cmds, gitSweepCmd(m.ctx, m.cwd, true))
+	}
 	// In auto mode, ask the terminal for its background color; the reply arrives
 	// as tea.BackgroundColorMsg and selects light vs dark (see updateModel).
 	if m.themeMode == themeAuto {
@@ -1058,6 +1080,14 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleCtrlC()
 		case keyCtrl(msg, 'o'):
 			return m.toggleDetailedTranscript(), nil
+		case m.fileView.active && m.noBlockingModal() && m.composerValue() == "" && (keyText(msg) == "d" || keyText(msg) == "f"):
+			// Mode toggle for the file drill-in, only while the composer is empty
+			// (so mid-sentence typing is never hijacked) and no modal is up (so a
+			// permission prompt / ask-user / wizard keeps its own key handling).
+			if keyText(msg) == "f" {
+				return m.setFileViewMode(fileViewFull), nil
+			}
+			return m.setFileViewMode(fileViewDiff), nil
 		case keyCtrl(msg, 'e'):
 			// Release/recapture the mouse so the user can drag-select and copy text
 			// natively (mouse capture otherwise intercepts terminal selection).
@@ -1081,6 +1111,14 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.chatScrollOffset = m.subchat.exit()
 				m = m.clearHover() // bodyY numbering differs between subchat and the parent transcript
 				return m, nil
+			}
+			// File drill-in exits on Esc (returns to the chat at its saved scroll
+			// position); the file stays selected so a second Esc clears that. Only
+			// with no blocking modal up: Esc on a permission prompt / ask-user /
+			// wizard must reach THAT surface's deny/cancel handling below, not
+			// silently close the drill-in behind it.
+			if m.fileView.active && m.noBlockingModal() {
+				return m.exitFileView(), nil
 			}
 			if m.mcpCommandCancel != nil {
 				m.cancelMCPCommand()
@@ -1137,6 +1175,13 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.suggestionsActive() {
 				return m.dismissSuggestions(), nil
+			}
+			// A selected FILES row clears before anything run-related: the
+			// selection is a passive highlight, so Esc dropping it is cheap and
+			// expected (mirrors how editors clear selection on Esc).
+			if m.selectedFile != "" {
+				m.selectedFile = ""
+				return m, nil
 			}
 			if m.hasQueuedMessage() {
 				return m.clearQueuedMessage(), nil
@@ -1812,8 +1857,13 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m, recapCmd = m.maybeRecapTurn(msg.runID, finalAnswer)
 		}
+		// End-of-turn git sweep: catch file mutations the tool stream couldn't
+		// report (bash scaffolding, subagent edits) so the FILES sidebar is
+		// complete once the turn settles.
+		var sweepCmd tea.Cmd
+		m, sweepCmd = m.maybeGitSweep()
 		next, queuedCmd := m.launchQueuedMessageIfReady()
-		return next, tea.Batch(titleCmd, recapCmd, queuedCmd)
+		return next, tea.Batch(titleCmd, recapCmd, sweepCmd, queuedCmd)
 	case sessionTitleGeneratedMsg:
 		return m.handleSessionTitleGenerated(msg)
 	case recapGeneratedMsg:
@@ -1964,6 +2014,14 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.transcript = collapseRepeatedStatusCard(m.transcript, msg.row)
 		m.transcript = appendTranscriptRow(m.transcript, msg.row)
 		m = m.captureStepWork(msg.row)
+		// A finished command tool may have mutated files git can see but no
+		// changedFiles reports (npm create, heredoc writes, subagent edits) —
+		// re-sweep so the FILES sidebar picks them up mid-turn.
+		if msg.row.kind == rowToolResult && isPlanCommandTool(msg.row.tool) {
+			var sweep tea.Cmd
+			m, sweep = m.maybeGitSweep()
+			return m, sweep
+		}
 		return m, nil
 	case swarmSessionsMsg:
 		// Merge completed swarm members' session ids so their AGENTS sidebar rows
@@ -1994,6 +2052,8 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case prStateMsg:
 		m.prState = msg.state
 		return m, nil
+	case gitSweepMsg:
+		return m.handleGitSweepMsg(msg), nil
 	case prWatcherStartedMsg:
 		if msg.stop == nil {
 			return m, nil
@@ -2197,6 +2257,12 @@ func (m model) titleBarInTranscriptBody() bool {
 func (m model) pinnedTitleBar(width int) string {
 	if !m.altScreen || m.height <= 0 {
 		return ""
+	}
+	// The file drill-in replaces the title bar with its nav line (path + key
+	// hints). Both are exactly one line, and every frame computation routes
+	// through here, so the swap never desyncs the viewport geometry.
+	if m.fileView.active {
+		return m.fileViewNavBar(width)
 	}
 	return m.titleBar(width)
 }
@@ -4298,13 +4364,14 @@ func (m model) runAgentWithOptions(runID int, runCtx context.Context, prompt str
 				}
 			}
 			row := transcriptRow{
-				kind:   rowToolResult,
-				id:     effectiveToolRowID(result.ToolCallID, callSeq[result.ToolCallID]),
-				text:   toolResultRowText(result),
-				tool:   result.Name,
-				status: result.Status,
-				detail: toolResultDetail(result),
-				runID:  runID,
+				kind:         rowToolResult,
+				id:           effectiveToolRowID(result.ToolCallID, callSeq[result.ToolCallID]),
+				text:         toolResultRowText(result),
+				tool:         result.Name,
+				status:       result.Status,
+				detail:       toolResultDetail(result),
+				runID:        runID,
+				changedFiles: result.ChangedFiles,
 			}
 			// A Task result is shown by the specialist card, and update_plan by the
 			// plan panel/sidebar, so skip both redundant transcript rows.
