@@ -142,6 +142,13 @@ the key in the wizard:
 export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=...
 export GEMINI_API_KEY=...
+export LONGCAT_API_KEY=...
+```
+
+To configure Meituan LongCat (LongCat-2.0) directly, run:
+
+```bash
+zero providers setup longcat --set-active
 ```
 
 For local models, run Ollama or LM Studio and then use `zero setup` or
