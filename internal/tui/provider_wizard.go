@@ -1602,7 +1602,7 @@ func providerWizardEndpointError(value string) string {
 		return "endpoint URL must start with http:// or https://"
 	}
 	if parsed.Scheme == "http" && !providerWizardIsLoopbackHost(parsed.Hostname()) {
-		return "endpoint URL must use https:// unless it is local loopback"
+		return "endpoint URL must use https:// unless it is local loopback or a private network address"
 	}
 	return ""
 }
@@ -1613,7 +1613,7 @@ func providerWizardIsLoopbackHost(host string) bool {
 		return true
 	}
 	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate())
 }
 
 func providerWizardDisplayName(provider providercatalog.Descriptor, baseURL string, profileName string) string {

@@ -1170,7 +1170,8 @@ func profileHasCredential(profile config.ProviderProfile) bool {
 }
 
 // baseURLIsLoopback reports whether a provider base_url points at a loopback host
-// (a keyless local provider like Ollama/LM Studio), which needs no API key.
+// or a private-network host (192.168.x.y / 10.x.y.z / 172.16.x.y) — a local
+// provider like Ollama/LM Studio that needs no API key.
 func baseURLIsLoopback(baseURL string) bool {
 	u := strings.TrimSpace(baseURL)
 	if u == "" {
@@ -1185,7 +1186,7 @@ func baseURLIsLoopback(baseURL string) bool {
 		return true
 	}
 	if addr, err := netip.ParseAddr(host); err == nil {
-		return addr.IsLoopback()
+		return addr.IsLoopback() || addr.IsPrivate()
 	}
 	return false
 }
