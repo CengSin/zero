@@ -181,8 +181,12 @@ func TestDetectShellCommandIssueFlagsPipedPosixUtilities(t *testing.T) {
 		`cat file.txt | wc -l`,
 		`some_command | tail -n 20`,
 	} {
-		if issue := detectShellCommandIssue(command, "windows"); issue == nil {
+		issue := detectShellCommandIssue(command, "windows")
+		if issue == nil {
 			t.Fatalf("expected POSIX utility pipeline to be flagged for %q", command)
+		}
+		if issue.Kind != "windows_msys_sandbox" {
+			t.Fatalf("expected windows_msys_sandbox for %q, got %q", command, issue.Kind)
 		}
 	}
 }
@@ -195,7 +199,7 @@ func TestDetectShellCommandIssueAllowsUnrelatedCommands(t *testing.T) {
 		`echo header text`,
 		`tail-log.sh`,
 		`grep-cli --version`,
-		`sed.exe --help`,
+		`mytool.exe --help`,
 	} {
 		if issue := detectShellCommandIssue(command, "windows"); issue != nil {
 			t.Fatalf("expected unrelated command to pass for %q, got %#v", command, issue)
@@ -204,7 +208,7 @@ func TestDetectShellCommandIssueAllowsUnrelatedCommands(t *testing.T) {
 }
 
 func TestDetectShellOutputIssueAddsWindowsSyntaxHint(t *testing.T) {
-	issue := detectShellOutputIssue(`cd /d/tmp/zero-pr-158 && ls -la`, "The syntax of the command is incorrect.", "windows")
+	issue := detectShellOutputIssue("The syntax of the command is incorrect.", "windows")
 	if issue == nil {
 		t.Fatal("expected Windows syntax error to get shell guidance")
 	}
@@ -431,6 +435,105 @@ func TestRegistryRunsWithDegradedUnavailableNativeSandbox(t *testing.T) {
 	}
 	if result.Meta["sandbox_wrapped"] != "false" || result.Meta["sandbox_enforcement_level"] != string(sandbox.EnforcementDegraded) {
 		t.Fatalf("sandbox metadata = %#v, want degraded direct plan", result.Meta)
+	}
+}
+
+// TestBashToolRequireEscalatedMsysGuard covers the boundary of the fix for an
+// escalation-vs-preflight ordering bug: the MSYS sandbox guard exists only
+// because MSYS/Cygwin coreutils fail under the write-restricted sandbox, so
+// once sandbox_permissions: require_escalated is actually approved (running
+// the command unsandboxed), the guard must get out of the way, but an
+// unrelated windows_shell_syntax issue (a real cmd.exe syntax problem, not a
+// sandbox interaction) must still block regardless of escalation.
+func TestBashToolRequireEscalatedMsysGuard(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows-only MSYS sandbox guard")
+	}
+	root := t.TempDir()
+	newEngine := func() *sandbox.Engine {
+		return sandbox.NewEngine(sandbox.EngineOptions{
+			WorkspaceRoot: root,
+			Policy:        sandbox.DefaultPolicy(),
+			Backend:       sandbox.Backend{Name: sandbox.BackendUnavailable, Message: "native sandbox unavailable"},
+		})
+	}
+	registry := NewRegistry()
+	registry.Register(NewBashTool(root))
+
+	t.Run("default sandboxing still blocks an MSYS-prone command", func(t *testing.T) {
+		result := registry.RunWithOptions(context.Background(), "bash", map[string]any{
+			"command": "cat somefile.txt",
+		}, RunOptions{
+			PermissionGranted: true,
+			Sandbox:           newEngine(),
+			PermissionMode:    string(sandbox.PermissionModeAsk),
+		})
+		if result.Meta["shell_issue"] != "windows_msys_sandbox" {
+			t.Fatalf("expected windows_msys_sandbox block without escalation, got %#v", result)
+		}
+	})
+
+	t.Run("approved require_escalated bypasses the MSYS guard", func(t *testing.T) {
+		result := registry.RunWithOptions(context.Background(), "bash", map[string]any{
+			"command":             "cat somefile.txt",
+			"sandbox_permissions": string(SandboxPermissionsRequireEscalated),
+		}, RunOptions{
+			PermissionGranted: true,
+			Sandbox:           newEngine(),
+			PermissionMode:    string(sandbox.PermissionModeAsk),
+		})
+		// Assert on the preflight block sentinel (exit_code "-1", set only by
+		// shellIssueBlockResult) rather than shell_issue: once the guard is
+		// bypassed, "cat somefile.txt" actually runs, and its real,
+		// PATH-dependent output could otherwise trip the unrelated
+		// post-execution detectShellOutputIssue heuristic and make this
+		// assertion flaky for reasons unrelated to the guard under test.
+		if result.Meta["exit_code"] == "-1" {
+			t.Fatalf("expected approved require_escalated to bypass the MSYS guard, got blocked: %#v", result)
+		}
+	})
+
+	t.Run("approved require_escalated still blocks an unrelated syntax issue", func(t *testing.T) {
+		result := registry.RunWithOptions(context.Background(), "bash", map[string]any{
+			"command":             `cd /d/tmp/zero-pr-158 && dir`,
+			"sandbox_permissions": string(SandboxPermissionsRequireEscalated),
+		}, RunOptions{
+			PermissionGranted: true,
+			Sandbox:           newEngine(),
+			PermissionMode:    string(sandbox.PermissionModeAsk),
+		})
+		if result.Meta["shell_issue"] != "windows_shell_syntax" {
+			t.Fatalf("expected windows_shell_syntax block to still apply under require_escalated, got %#v", result)
+		}
+	})
+}
+
+// TestBashToolIgnoresMsysMarkersInCommandArgumentsAfterFailure guards the
+// post-execution MSYS heuristic against treating the command line itself as
+// evidence. The helper command below fails for a reason unrelated to MSYS
+// (a plain non-zero exit), but its own argument text quotes an MSYS crash
+// marker the way a PR-comment or commit-message argument might. Before the
+// fix, detectShellOutputIssue scanned command+output together and would have
+// misdiagnosed this as an MSYS sandbox failure even though the real
+// stdout/stderr never mentions MSYS at all.
+func TestBashToolIgnoresMsysMarkersInCommandArgumentsAfterFailure(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows-only MSYS output guard")
+	}
+	root := t.TempDir()
+	// The helper only reads argv[2] ("fail"); this trailing quoted argument is
+	// otherwise unused by the helper but still part of the command line text.
+	command := helperCommand("fail") + ` "fatal error - CreateFileMapping S-1-5-21, Win32 error 5. Terminating. cygheap_user::init"`
+
+	result := NewBashTool(root).Run(context.Background(), map[string]any{
+		"command": command,
+	})
+
+	if result.Status != StatusError || result.Meta["exit_code"] != "7" {
+		t.Fatalf("expected the helper's real exit 7 failure, got %s: %#v", result.Status, result)
+	}
+	if result.Meta["shell_issue"] == "windows_msys_sandbox" {
+		t.Fatalf("expected the MSYS marker in the command's own argument text to be ignored, got %#v", result)
 	}
 }
 

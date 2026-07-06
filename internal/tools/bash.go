@@ -83,7 +83,12 @@ func (tool bashTool) run(ctx context.Context, args map[string]any, engine *zeroS
 	if err != nil {
 		return errorResult("Error: Invalid arguments for bash: " + err.Error())
 	}
-	if issue := detectShellCommandIssue(commandText, runtime.GOOS); issue != nil {
+	// Resolve the command engine before the MSYS preflight check so an
+	// approved require_escalated call (commandEngine == nil, truly
+	// unsandboxed) can actually bypass the MSYS guard instead of being
+	// hard-blocked by the same check it was meant to escalate past.
+	commandEngine := commandEngineForSandboxPermissions(engine, sandboxPermissions)
+	if issue := detectShellCommandIssue(commandText, runtime.GOOS); issue != nil && !msysGuardBypassed(issue, commandEngine) {
 		return shellIssueBlockResult(*issue)
 	}
 
@@ -106,7 +111,6 @@ func (tool bashTool) run(ctx context.Context, args map[string]any, engine *zeroS
 		"cwd":        relativeCwd,
 		"timeout_ms": strconv.Itoa(timeoutMS),
 	}
-	commandEngine := commandEngineForSandboxPermissions(engine, sandboxPermissions)
 	if commandEngine == nil && sandboxPermissions == SandboxPermissionsRequireEscalated {
 		meta["sandbox_permissions"] = string(SandboxPermissionsRequireEscalated)
 	}
@@ -167,7 +171,7 @@ func (tool bashTool) run(ctx context.Context, args map[string]any, engine *zeroS
 		outText, errText, truncated := budgetBashCapture(stdoutText, stdout.total, stderrText, stderrTotal, meta)
 		return Result{
 			Status:    StatusError,
-			Output:    formatBashOutputWithShellHint(commandText, outText, errText, exitCode, meta),
+			Output:    formatBashOutputWithShellHint(outText, errText, exitCode, meta),
 			Truncated: truncated,
 			Meta:      meta,
 		}
@@ -178,7 +182,7 @@ func (tool bashTool) run(ctx context.Context, args map[string]any, engine *zeroS
 	if meta[SandboxLikelyDeniedMeta] == "true" {
 		return Result{
 			Status:    StatusError,
-			Output:    formatBashOutputWithShellHint(commandText, outText, errText, exitCode, meta),
+			Output:    formatBashOutputWithShellHint(outText, errText, exitCode, meta),
 			Truncated: truncated,
 			Meta:      meta,
 		}
@@ -196,6 +200,18 @@ func commandEngineForSandboxPermissions(engine *zeroSandbox.Engine, sandboxPermi
 		return nil
 	}
 	return engine
+}
+
+// msysGuardBypassed reports whether a windows_msys_sandbox preflight issue no
+// longer applies because sandbox_permissions: require_escalated actually
+// resolved to unsandboxed, host-level execution (commandEngine is nil only
+// then, per commandEngineForSandboxPermissions). MSYS coreutils fail because
+// of the sandbox's restricted token/handles, so running outside it removes
+// the failure mode this guard exists for. Any other issue kind (e.g. a real
+// cmd.exe syntax problem) still blocks regardless of escalation, since
+// running outside the sandbox does not fix a syntax error.
+func msysGuardBypassed(issue *shellIssue, commandEngine *zeroSandbox.Engine) bool {
+	return issue.Kind == windowsMsysSandboxKind && commandEngine == nil
 }
 
 // appendSandboxBlocks appends a <sandbox_blocks> block listing the denials
@@ -520,14 +536,6 @@ func (b *boundedBuffer) retained() string {
 	return string(b.head) + string(b.tail)
 }
 
-// truncateHeadTail keeps the first and last halves of value when it exceeds
-// maxBytes, dropping the middle behind a marker. Returns the possibly-truncated
-// text, the raw byte length, and whether truncation happened.
-func truncateHeadTail(value string, maxBytes int) (string, int, bool) {
-	// value holds the whole stream, so its length is the true raw size.
-	return truncateHeadTailWithTotal(value, len(value), maxBytes)
-}
-
 // truncateHeadTailWithTotal head+tail-truncates value to maxBytes, using total —
 // the full original byte count — for the "N bytes omitted" marker and the raw
 // count. total may exceed len(value) when the middle was already discarded during
@@ -547,9 +555,9 @@ func truncateHeadTailWithTotal(value string, total, maxBytes int) (string, int, 
 	return utf8Prefix(value, head) + marker + utf8Suffix(value, tail), total, true
 }
 
-func formatBashOutputWithShellHint(command string, stdout string, stderr string, exitCode int, meta map[string]string) string {
+func formatBashOutputWithShellHint(stdout string, stderr string, exitCode int, meta map[string]string) string {
 	output := formatBashOutput(stdout, stderr, exitCode)
-	if issue := detectShellOutputIssue(command, stdout+"\n"+stderr, runtime.GOOS); issue != nil {
+	if issue := detectShellOutputIssue(stdout+"\n"+stderr, runtime.GOOS); issue != nil {
 		meta["shell_issue"] = issue.Kind
 		output = appendShellIssueHint(output, *issue)
 	}

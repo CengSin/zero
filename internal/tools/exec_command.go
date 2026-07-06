@@ -517,7 +517,12 @@ func (tool execCommandTool) run(ctx context.Context, args map[string]any, engine
 	if err != nil {
 		return errorResult("Error: Invalid arguments for exec_command: " + err.Error())
 	}
-	if issue := detectShellCommandIssue(commandText, runtimeGOOS()); issue != nil {
+	// Resolve the command engine before the MSYS preflight check so an
+	// approved require_escalated call (commandEngine == nil, truly
+	// unsandboxed) can actually bypass the MSYS guard instead of being
+	// hard-blocked by the same check it was meant to escalate past.
+	commandEngine := commandEngineForSandboxPermissions(engine, sandboxPermissions)
+	if issue := detectShellCommandIssue(commandText, runtimeGOOS()); issue != nil && !msysGuardBypassed(issue, commandEngine) {
 		return shellIssueBlockResult(*issue)
 	}
 	if interactive := zeroSandbox.DetectInteractiveCommand(commandText, runtimeGOOS()); interactive.Interactive {
@@ -860,6 +865,12 @@ func execToolResult(input execToolResultInput) Result {
 		status = StatusError
 	}
 	body := formatExecCommandOutput(output, input.sessionID, input.exited, input.exitCode, input.interrupted)
+	if status == StatusError && input.exited && !input.interrupted {
+		if issue := detectShellOutputIssue(output, runtimeGOOS()); issue != nil {
+			meta["shell_issue"] = issue.Kind
+			body = appendShellIssueHint(body, *issue)
+		}
+	}
 	if input.outputBufferTruncated {
 		// Appended after truncateExecOutput's own head/tail slicing, not
 		// embedded in the text that goes through it — a marker inside that
