@@ -2,13 +2,12 @@ package skills
 
 // Distribution: install a skill from a git URL or a local path into the skills
 // directory, with a content hash recorded in a lockfile (skills.lock) so every
-// install/update is verifiable. Skills are markdown, so install NEVER executes
-// fetched content — it copies and validates the SKILL.md and nothing else.
+// install/update is verifiable. Install copies the full skill directory tree
+// (SKILL.md plus any scripts, assets, or subdirectories) but NEVER executes
+// fetched content.
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +16,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/Gitlawb/zero/internal/fscopy"
 )
 
 // LockFileName is the name of the per-directory lockfile that maps an installed
@@ -53,7 +54,7 @@ type InstallOptions struct {
 // InstallResult reports what an install did.
 type InstallResult struct {
 	Name string `json:"name"`
-	// Path is the absolute path to the installed SKILL.md.
+	// Path is the absolute path to the installed skill directory.
 	Path string `json:"path"`
 	// Hash is the content hash recorded for the installed skill.
 	Hash string `json:"hash"`
@@ -79,7 +80,8 @@ type SkillInfo struct {
 	Hash   string `json:"hash,omitempty"`
 }
 
-// Install fetches the skill at options.Source and copies its SKILL.md into
+// Install fetches the skill at options.Source and copies its full directory tree
+// (SKILL.md plus any scripts, assets, or subdirectories) into
 // options.Dir/<name>/, validating the frontmatter and recording a content hash
 // in the lockfile. A git URL is fetched via the (injectable) GitRunner into a
 // temp dir; a local path is read in place. Fetched content is never executed.
@@ -120,7 +122,10 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 		return InstallResult{}, fmt.Errorf("skill has no usable name (set a frontmatter `name:` or use a directory name of letters, numbers, dots, dashes, or underscores)")
 	}
 
-	hash := hashContent(data)
+	hash, err := fscopy.HashTree(skillDir)
+	if err != nil {
+		return InstallResult{}, fmt.Errorf("hash skill: %w", err)
+	}
 
 	lock, err := ReadLock(dir)
 	if err != nil {
@@ -136,16 +141,15 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return InstallResult{}, fmt.Errorf("create skills dir: %w", err)
 	}
-	// Replace any existing install atomically-enough: write the new SKILL.md after
+	// Replace any existing install atomically-enough: copy the new tree after
 	// clearing a prior directory so a re-install never mixes old and new files.
 	if err := os.RemoveAll(target); err != nil {
 		return InstallResult{}, fmt.Errorf("clear previous skill: %w", err)
 	}
-	if err := os.MkdirAll(target, 0o755); err != nil {
-		return InstallResult{}, fmt.Errorf("create skill dir: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(target, skillFileName), data, 0o644); err != nil {
-		return InstallResult{}, fmt.Errorf("write SKILL.md: %w", err)
+	// Copy the full skill tree (SKILL.md, scripts, assets, subdirectories).
+	// Copy DATA only — never execute anything.
+	if err := fscopy.CopyTree(skillDir, target); err != nil {
+		return InstallResult{}, fmt.Errorf("copy skill: %w", err)
 	}
 
 	lock[name] = LockEntry{Source: source, Hash: hash}
@@ -155,7 +159,7 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 
 	result := InstallResult{
 		Name:   name,
-		Path:   filepath.Join(target, skillFileName),
+		Path:   target,
 		Hash:   hash,
 		Source: source,
 	}
@@ -418,9 +422,4 @@ func validSkillName(name string) bool {
 		return false
 	}
 	return name == filepath.Base(name)
-}
-
-func hashContent(data []byte) string {
-	sum := sha256.Sum256(data)
-	return "sha256:" + hex.EncodeToString(sum[:])
 }

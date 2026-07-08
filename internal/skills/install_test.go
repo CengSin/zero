@@ -317,10 +317,10 @@ func TestInstallGitSourceUsesRunnerAndDoesNotExecuteContent(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cloneRoot, "PWNED")); err == nil {
 		t.Fatalf("install must never execute fetched content")
 	}
-	// The fetched executable must not be copied into the skills dir either (skills
-	// are markdown — only SKILL.md is installed, not arbitrary fetched files).
-	if _, err := os.Stat(filepath.Join(destDir, "remote", "install.sh")); err == nil {
-		t.Fatalf("install must not copy fetched executable into the skills dir")
+	// The fetched executable IS copied into the skills dir (the full tree is
+	// installed so scripts/assets are available), but it must never be executed.
+	if _, err := os.Stat(filepath.Join(destDir, "remote", "install.sh")); err != nil {
+		t.Fatalf("install must copy fetched scripts into the skills dir: %v", err)
 	}
 }
 

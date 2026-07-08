@@ -29,8 +29,7 @@ func (m model) handleSkillCommand(raw string) (model, tea.Cmd, bool) {
 	if !ok {
 		return m, nil, false
 	}
-	body := strings.TrimSpace(skill.Content)
-	if body == "" {
+	if strings.TrimSpace(skill.Content) == "" {
 		// The name matched a real skill, so falling through to "unknown command"
 		// would mislead; surface the actual problem instead.
 		m.transcript = reduceTranscript(m.transcript, transcriptAction{
@@ -39,7 +38,7 @@ func (m model) handleSkillCommand(raw string) (model, tea.Cmd, bool) {
 		})
 		return m, nil, true
 	}
-	return m.launchOrDeferExpandedPrompt(raw, skillInvocationPrompt(body, args))
+	return m.launchOrDeferExpandedPrompt(raw, skillInvocationPrompt(skills.FormatOutput(skill), args))
 }
 
 // bareSkillInvocationNote is appended when a skill is invoked with no request.
@@ -137,15 +136,14 @@ func (m model) invokeSkillByName(name string) (model, tea.Cmd) {
 		if strings.TrimSpace(skill.Name) != name {
 			continue
 		}
-		body := strings.TrimSpace(skill.Content)
-		if body == "" {
+		if strings.TrimSpace(skill.Content) == "" {
 			m.transcript = reduceTranscript(m.transcript, transcriptAction{
 				kind: actionAppendError,
 				text: "skill " + name + " has an empty SKILL.md body (" + skill.Path + ")",
 			})
 			return m, nil
 		}
-		next, teaCmd, _ := m.launchOrDeferExpandedPrompt("", skillInvocationPrompt(body, ""))
+		next, teaCmd, _ := m.launchOrDeferExpandedPrompt("", skillInvocationPrompt(skills.FormatOutput(skill), ""))
 		return next, teaCmd
 	}
 	// The picker row came from a slightly older load (TTL cache) and the skill

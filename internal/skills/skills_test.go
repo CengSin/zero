@@ -3,8 +3,10 @@ package skills
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func writeSkill(t *testing.T, dir string, name string, content string) {
@@ -290,5 +292,204 @@ func TestDefaultDirFallsBackToHome(t *testing.T) {
 	want := filepath.Join("/home/zero", ".local", "share", "zero", "skills")
 	if got != want {
 		t.Fatalf("DefaultDir = %q, want %q", got, want)
+	}
+}
+
+// writeSkillWithAssets creates a skill at dir/name with SKILL.md plus the given
+// extra files (relative paths under the skill dir) — used to exercise asset
+// discovery.
+func writeSkillWithAssets(t *testing.T, dir, name, skillmd string, extras map[string]string) {
+	t.Helper()
+	skillDir := filepath.Join(dir, name)
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", skillDir, err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(skillmd), 0o644); err != nil {
+		t.Fatalf("write SKILL.md: %v", err)
+	}
+	for rel, content := range extras {
+		full := filepath.Join(skillDir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir for %s: %v", full, err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", full, err)
+		}
+	}
+}
+
+// #2: loadAssets must recurse into subdirectories so files like scripts/run.sh
+// — which fscopy.CopyTree installs to disk — are listed in Skill.Assets. Issue
+// #584 asks for "contents of subdirectories" in the skill context.
+func TestLoadDiscoversAssetsRecursively(t *testing.T) {
+	dir := t.TempDir()
+	writeSkillWithAssets(t, dir, "deploy",
+		"---\nname: deploy\ndescription: d\n---\nbody",
+		map[string]string{
+			"lint.sh":        "#!/bin/sh\necho lint\n",
+			"config.yaml":    "key: value\n",
+			"scripts/run.sh": "#!/bin/sh\necho run\n",
+			"lib/util.py":    "def util():\n    pass\n",
+		},
+	)
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded) != 1 || loaded[0].Name != "deploy" {
+		t.Fatalf("expected deploy skill, got %+v", loaded)
+	}
+	skill := loaded[0]
+	wantNames := map[string]bool{
+		"config.yaml":    true,
+		"lint.sh":        true,
+		"scripts/run.sh": true, // slash-form, matching filepath.ToSlash
+		"lib/util.py":    true,
+	}
+	gotNames := map[string]bool{}
+	for _, a := range skill.Assets {
+		gotNames[a.Name] = true
+	}
+	for want := range wantNames {
+		if !gotNames[want] {
+			t.Errorf("expected asset %q in Skill.Assets, got %v", want, skill.Assets)
+		}
+	}
+	if len(skill.Assets) != len(wantNames) {
+		t.Errorf("expected %d assets, got %d (%v)", len(wantNames), len(skill.Assets), skill.Assets)
+	}
+	// SKILL.md must not be listed as an asset (it's the Content).
+	for _, a := range skill.Assets {
+		if strings.EqualFold(a.Name, "SKILL.md") {
+			t.Errorf("SKILL.md must not appear in Assets")
+		}
+	}
+}
+
+// #2/#5: hidden files and subdirectories are skipped at every level (.git,
+// .env, .DS_Store), so a .git inside a subdirectory does not leak assets.
+func TestLoadSkipsHiddenFilesAndDirsAtEveryLevel(t *testing.T) {
+	dir := t.TempDir()
+	writeSkillWithAssets(t, dir, "s",
+		"---\nname: s\n---\nbody",
+		map[string]string{
+			".env":            "SECRET=1\n",
+			".git/config":     "[remote]\n",
+			"scripts/.secret": "x\n",
+		},
+	)
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(loaded))
+	}
+	for _, a := range loaded[0].Assets {
+		if strings.Contains(a.Name, ".env") || strings.Contains(a.Name, ".git") || strings.Contains(a.Name, ".secret") {
+			t.Errorf("hidden file/dir leaked into Assets: %q", a.Name)
+		}
+	}
+}
+
+// #6: FormatOutput must NOT emit the absolute install path (which contains the
+// user's home directory) for each asset. Asset names are skill-relative; the
+// skill directory is exposed once via dir= and assets are listed by relative
+// path only. The skill tool is permission-allow and its output flows to the
+// provider, so the absolute home path must not leak per-asset.
+func TestFormatOutputDoesNotLeakAbsoluteAssetPaths(t *testing.T) {
+	dir := t.TempDir()
+	writeSkillWithAssets(t, dir, "s",
+		"---\nname: s\n---\nbody",
+		map[string]string{"scripts/run.sh": "#!/bin/sh\necho\n"},
+	)
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(loaded))
+	}
+	out := FormatOutput(loaded[0])
+	// The relative asset name must appear; the absolute skills dir must not be
+	// repeated per-asset (it appears once in dir=).
+	if !strings.Contains(out, "scripts/run.sh") {
+		t.Errorf("expected relative asset name in output, got:\n%s", out)
+	}
+	// Count occurrences of the skills root path: it should appear exactly once
+	// (in dir=), never inside the <skill_assets> block. FormatOutput emits dir=
+	// via fmt's %q, which escapes backslashes (e.g. C:\Users -> C:\\Users on
+	// Windows), so we must match the quoted form — matching the raw path would
+	// fail on Windows and, on POSIX, would over-count because dir= is a parent
+	// of the asset relative paths.
+	skillsRoot := strconv.Quote(loaded[0].Dir)
+	count := strings.Count(out, skillsRoot)
+	if count != 1 {
+		t.Errorf("expected skills root %q to appear exactly once (in dir=), got %d times:\n%s", loaded[0].Dir, count, out)
+	}
+}
+
+// #1: FormatOutput truncation must stay on a UTF-8 rune boundary so a large
+// multi-byte body does not produce invalid UTF-8, and must not split an asset
+// line mid-entry. A body of CJK characters that exceeds the cap is the
+// regression case.
+func TestFormatOutputTruncatesOnRuneBoundary(t *testing.T) {
+	// Build a skill whose total output comfortably exceeds maxSkillOutputSize
+	// using multi-byte (CJK) content, so the cut boundary lands inside a rune.
+	dir := t.TempDir()
+	// "中" is 3 bytes; repeat well past the 100KB cap.
+	body := strings.Repeat("中", (maxSkillOutputSize/3)+200)
+	writeSkill(t, dir, "big", "---\nname: big\n---\n"+body)
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(loaded))
+	}
+	out := FormatOutput(loaded[0])
+	if !strings.HasSuffix(out, "\n(output truncated)") {
+		t.Fatalf("expected truncation note at end, got suffix %q", out[len(out)-60:])
+	}
+	// utf8.ValidString catches a split multi-byte rune.
+	if !utf8.ValidString(out) {
+		t.Fatalf("FormatOutput produced invalid UTF-8 after truncation (split rune)")
+	}
+}
+
+// #5 sanity: loadAssets uses confineSkillPath's returned FileInfo and does not
+// re-stat, so a symlinked asset pointing OUTSIDE the skills root is skipped
+// (not just the SKILL.md symlink path). Guards the permission-allow skill tool.
+func TestLoadSkipsSymlinkedAssetEscapingRoot(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("TOP SECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	skillDir := filepath.Join(dir, "s")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: s\n---\nbody"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(skillDir, "leak.txt")); err != nil {
+		t.Skipf("symlink unavailable on this platform: %v", err)
+	}
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(loaded))
+	}
+	for _, a := range loaded[0].Assets {
+		if a.Name == "leak.txt" || strings.Contains(a.Path, "secret.txt") {
+			t.Fatalf("symlinked asset escaping the root must be skipped, got %+v", a)
+		}
 	}
 }

@@ -8,17 +8,16 @@ package plugins
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/Gitlawb/zero/internal/fscopy"
 )
 
 // manifestFileName is the plugin manifest filename, matching the loader.
@@ -123,7 +122,7 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 	// Hash the SAME filtered tree that copyTree installs (not just the manifest),
 	// so a change to any installed file — a tool script, prompt, or bundled skill —
 	// is reflected in the lock hash and reported as an update.
-	hash, err := hashTree(pluginDir)
+	hash, err := fscopy.HashTree(pluginDir)
 	if err != nil {
 		return InstallResult{}, fmt.Errorf("hash plugin: %w", err)
 	}
@@ -146,7 +145,7 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 	}
 	// Copy the whole plugin tree (entry scripts, prompts, skills) so the installed
 	// plugin is runnable through activation. Copy DATA only — never execute it.
-	if err := copyTree(pluginDir, target); err != nil {
+	if err := fscopy.CopyTree(pluginDir, target); err != nil {
 		return InstallResult{}, fmt.Errorf("copy plugin: %w", err)
 	}
 
@@ -322,67 +321,6 @@ func locatePluginDir(root string) (string, error) {
 	}
 }
 
-// copyTree recursively copies regular files and directories from src to dst. It
-// skips the .git directory (clone metadata) and refuses symlinks so a malicious
-// source cannot smuggle a link that escapes the install dir. Copying is pure
-// I/O — it never executes anything it copies.
-func copyTree(src string, dst string) error {
-	entries, err := os.ReadDir(src)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(dst, 0o755); err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if name == ".git" {
-			continue
-		}
-		srcPath := filepath.Join(src, name)
-		dstPath := filepath.Join(dst, name)
-		info, err := os.Lstat(srcPath)
-		if err != nil {
-			return err
-		}
-		switch {
-		case info.Mode()&os.ModeSymlink != 0:
-			// Never recreate a symlink: it could point outside the install dir and
-			// turn a copy into a write/read primitive elsewhere.
-			continue
-		case info.IsDir():
-			if err := copyTree(srcPath, dstPath); err != nil {
-				return err
-			}
-		case info.Mode().IsRegular():
-			if err := copyFile(srcPath, dstPath, info.Mode().Perm()); err != nil {
-				return err
-			}
-		default:
-			// Skip FIFOs, sockets, devices.
-			continue
-		}
-	}
-	return nil
-}
-
-func copyFile(src string, dst string, perm os.FileMode) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		return err
-	}
-	return out.Close()
-}
-
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()
@@ -454,77 +392,4 @@ func validInstallID(id string) bool {
 		return false
 	}
 	return id == filepath.Base(id) && !strings.ContainsAny(id, `/\`) && !strings.Contains(id, "..")
-}
-
-// hashTree computes a content hash over the same filtered tree that copyTree
-// installs: regular files only, .git and symlinks skipped, walked in a stable
-// sorted order. Each file contributes its plugin-relative path, executable bit,
-// and bytes, so renames, mode flips, and content edits all change the hash.
-func hashTree(root string) (string, error) {
-	hasher := sha256.New()
-	if err := hashTreeInto(hasher, root, root); err != nil {
-		return "", err
-	}
-	return "sha256:" + hex.EncodeToString(hasher.Sum(nil)), nil
-}
-
-func hashTreeInto(hasher io.Writer, root string, dir string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return err
-	}
-	names := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		names = append(names, entry.Name())
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		if name == ".git" {
-			continue
-		}
-		path := filepath.Join(dir, name)
-		info, err := os.Lstat(path)
-		if err != nil {
-			return err
-		}
-		switch {
-		case info.Mode()&os.ModeSymlink != 0:
-			// Skipped by copyTree, so excluded from the hash too.
-			continue
-		case info.IsDir():
-			if err := hashTreeInto(hasher, root, path); err != nil {
-				return err
-			}
-		case info.Mode().IsRegular():
-			rel, err := filepath.Rel(root, path)
-			if err != nil {
-				return err
-			}
-			executable := 0
-			if info.Mode().Perm()&0o111 != 0 {
-				executable = 1
-			}
-			// Null-delimited header keeps file boundaries unambiguous (paths cannot
-			// contain null bytes) so two trees cannot collide by shifting bytes.
-			header := fmt.Sprintf("%s\x00%d\x00", filepath.ToSlash(rel), executable)
-			if _, err := io.WriteString(hasher, header); err != nil {
-				return err
-			}
-			file, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(hasher, file); err != nil {
-				_ = file.Close()
-				return err
-			}
-			if err := file.Close(); err != nil {
-				return err
-			}
-		default:
-			// FIFOs, sockets, devices: skipped by copyTree, excluded here.
-			continue
-		}
-	}
-	return nil
 }
