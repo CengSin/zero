@@ -47,7 +47,9 @@ func CopyTree(src string, dst string) error {
 				return err
 			}
 		case info.Mode().IsRegular():
-			if err := CopyFile(srcPath, dstPath, info.Mode().Perm()); err != nil {
+			// CopyFile re-stats the opened file descriptor itself (not this Lstat
+			// result) so there is no TOCTOU window between the check and the read.
+			if err := CopyFile(srcPath, dstPath); err != nil {
 				return err
 			}
 		default:
@@ -58,19 +60,40 @@ func CopyTree(src string, dst string) error {
 	return nil
 }
 
-// CopyFile copies a single regular file from src to dst with the given
-// permission bits. The destination is created or truncated.
-func CopyFile(src string, dst string, perm os.FileMode) error {
-	in, err := os.Open(src)
+// CopyFile copies a single regular file from src to dst. The source is opened
+// and then fstat'd on the already-open descriptor, so the kind and permission
+// bits come from the fd actually read — a symlink or other file type swapped in
+// after the open cannot be read or mis-classified (no TOCTOU). The destination
+// is created or truncated without following a final symlink (O_NOFOLLOW on
+// unix), so a pre-placed destination symlink cannot redirect the copy outside
+// the install dir. The source's permission bits are applied to the copy so
+// executables stay executable. Copying is pure I/O — it never executes anything.
+func CopyFile(src string, dst string) error {
+	in, err := openRegularRead(src)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		// The entry was regular when listed but the open resolved something else
+		// (e.g. a symlink or special file); refuse rather than copy it.
+		return &os.PathError{Op: "copy", Path: src, Err: fmt.Errorf("not a regular file")}
+	}
+	out, err := openRegularWrite(dst, uint32(info.Mode().Perm()))
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	// openRegularWrite applies perm & ~umask, which can drop requested bits;
+	// chmod the open descriptor so the source mode is preserved exactly.
+	if err := out.Chmod(info.Mode().Perm()); err != nil {
 		_ = out.Close()
 		return err
 	}
@@ -146,7 +169,7 @@ func hashTreeInto(hasher io.Writer, root string, dir string) error {
 			if _, err := io.WriteString(hasher, header); err != nil {
 				return err
 			}
-			file, err := os.Open(path)
+			file, err := openRegularRead(path)
 			if err != nil {
 				return err
 			}
