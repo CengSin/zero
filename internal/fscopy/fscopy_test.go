@@ -21,17 +21,15 @@ func writeFile(t *testing.T, dir, name, content string) string {
 }
 
 // TestCopyTreeCopiesRegularFiles verifies a tree of regular files is copied
-// verbatim, including the executable bit that CopyFile preserves from the fd
-// stat rather than the Lstat entry.
+// verbatim, content-preserved end to end. (The executable-bit round trip is
+// exercised on unix in fscopy_unix_test.go, since os.Chmod only toggles the
+// read-only bit on Windows and a 0644->0755 flip is a no-op there.)
 func TestCopyTreeCopiesRegularFiles(t *testing.T) {
 	src := t.TempDir()
 	dst := t.TempDir()
 
 	writeFile(t, src, "a/b.txt", "hello\n")
-	exe := writeFile(t, src, "bin/run.sh", "#!/bin/sh\n")
-	if err := os.Chmod(exe, 0o755); err != nil {
-		t.Fatalf("chmod %s: %v", exe, err)
-	}
+	writeFile(t, src, "bin/run.sh", "#!/bin/sh\n")
 
 	if err := CopyTree(src, dst); err != nil {
 		t.Fatalf("CopyTree: %v", err)
@@ -45,12 +43,8 @@ func TestCopyTreeCopiesRegularFiles(t *testing.T) {
 		t.Fatalf("content = %q, want %q", got, "hello\n")
 	}
 
-	info, err := os.Stat(filepath.Join(dst, "bin", "run.sh"))
-	if err != nil {
-		t.Fatalf("stat exe: %v", err)
-	}
-	if info.Mode().Perm() != 0o755 {
-		t.Fatalf("exec perm = %o, want 0o755", info.Mode().Perm())
+	if _, err := os.ReadFile(filepath.Join(dst, "bin", "run.sh")); err != nil {
+		t.Fatalf("bin/run.sh missing in dst: %v", err)
 	}
 }
 
@@ -129,16 +123,21 @@ func TestHashTreeOrderInvariantAndSensitive(t *testing.T) {
 		t.Fatalf("rename did not change hash: %v got=%s want=%s", err, got4, want)
 	}
 
-	// Sensitive: change executable bit -> hash changes.
-	root5 := t.TempDir()
-	writeFile(t, root5, "a.txt", "aaa")
-	exe := writeFile(t, root5, "b.txt", "bbb")
-	if err := os.Chmod(exe, 0o755); err != nil {
-		t.Fatalf("chmod: %v", err)
-	}
-	writeFile(t, root5, "dir/c.txt", "ccc")
-	if got5, err := HashTree(root5); err != nil || got5 == want {
-		t.Fatalf("exec bit flip did not change hash: %v got=%s want=%s", err, got5, want)
+	// Sensitive: change executable bit -> hash changes. (Unix only: on
+	// Windows os.Chmod only toggles the read-only bit, so a 0644->0755 flip
+	// is a no-op and the hash would not change — covered instead in
+	// fscopy_unix_test.go::TestHashTreeSensitiveToExecBit.)
+	if runtime.GOOS != "windows" {
+		root5 := t.TempDir()
+		writeFile(t, root5, "a.txt", "aaa")
+		exe := writeFile(t, root5, "b.txt", "bbb")
+		if err := os.Chmod(exe, 0o755); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		writeFile(t, root5, "dir/c.txt", "ccc")
+		if got5, err := HashTree(root5); err != nil || got5 == want {
+			t.Fatalf("exec bit flip did not change hash: %v got=%s want=%s", err, got5, want)
+		}
 	}
 
 	// Sensitive: change file size -> hash changes.
