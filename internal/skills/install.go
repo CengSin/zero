@@ -141,16 +141,28 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return InstallResult{}, fmt.Errorf("create skills dir: %w", err)
 	}
-	// Replace any existing install atomically-enough: copy the new tree after
-	// clearing a prior directory so a re-install never mixes old and new files.
-	if err := os.RemoveAll(target); err != nil {
-		return InstallResult{}, fmt.Errorf("clear previous skill: %w", err)
+	// Stage the new tree into a temp dir on the SAME filesystem as dir (its
+	// parent directory) so the swap into place is a single atomic rename. We
+	// copy FIRST and only clear the previous install AFTER the copy succeeds,
+	// so a failed copy (full disk, permission denied) leaves the previously
+	// installed skill and its lockfile entry completely intact instead of
+	// wiping them and stranding the lockfile pointing at a deleted directory.
+	staging, err := os.MkdirTemp(filepath.Dir(dir), ".zero-skill-install-")
+	if err != nil {
+		return InstallResult{}, fmt.Errorf("create staging dir: %w", err)
 	}
 	// Copy the full skill tree (SKILL.md, scripts, assets, subdirectories).
 	// Copy DATA only — never execute anything.
-	if err := fscopy.CopyTree(skillDir, target); err != nil {
+	if err := fscopy.CopyTree(skillDir, staging); err != nil {
+		_ = os.RemoveAll(staging)
 		return InstallResult{}, fmt.Errorf("copy skill: %w", err)
 	}
+	if err := swapDirIntoPlace(staging, target); err != nil {
+		_ = os.RemoveAll(staging)
+		return InstallResult{}, err
+	}
+	// staging was renamed into place (path no longer exists); RemoveAll is a no-op.
+	_ = os.RemoveAll(staging)
 
 	lock[name] = LockEntry{Source: source, Hash: hash}
 	if err := writeLock(dir, lock); err != nil {
@@ -168,6 +180,39 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 		result.PreviousHash = previous.Hash
 	}
 	return result, nil
+}
+
+// swapDirIntoPlace atomically replaces target with the already-complete staging
+// directory. staging must live on the same filesystem as target (Install creates
+// it in the target's parent). On success staging is consumed (renamed) and target
+// holds the new skill. On any failure target is left untouched and an error is
+// returned, so a half-copied install never destroys the previous one.
+func swapDirIntoPlace(staging string, target string) error {
+	// No existing install: a plain rename is already atomic.
+	if _, err := os.Stat(target); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat target: %w", err)
+		}
+		if err := os.Rename(staging, target); err != nil {
+			return fmt.Errorf("install skill: %w", err)
+		}
+		return nil
+	}
+
+	// Existing install present: move it aside, swap the new tree in, then drop
+	// the old one — but only after the swap succeeds, so a failed rename rolls
+	// the previous install back into place and the failure stays non-destructive.
+	backup := staging + ".old"
+	if err := os.Rename(target, backup); err != nil {
+		return fmt.Errorf("stash previous skill: %w", err)
+	}
+	if err := os.Rename(staging, target); err != nil {
+		// Roll the previous install back so the failure leaves the old skill intact.
+		_ = os.Rename(backup, target)
+		return fmt.Errorf("install skill: %w", err)
+	}
+	_ = os.RemoveAll(backup)
+	return nil
 }
 
 // Remove deletes an installed skill directory and its lockfile entry. It errors

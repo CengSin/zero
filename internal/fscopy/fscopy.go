@@ -157,25 +157,37 @@ func hashTreeInto(hasher io.Writer, root string, dir string) error {
 			if err != nil {
 				return err
 			}
-			executable := 0
-			if info.Mode().Perm()&0o111 != 0 {
-				executable = 1
-			}
-			// Null-delimited header tags the type, executable state, and exact
-			// byte size; paths cannot contain null bytes, and the size makes each
-			// file's content self-delimiting so two trees cannot collide by
-			// shifting bytes across file boundaries.
-			header := fmt.Sprintf("%s\x00file\x00%d\x00%d\x00", filepath.ToSlash(rel), executable, info.Size())
-			if _, err := io.WriteString(hasher, header); err != nil {
-				return err
-			}
 			file, err := openRegularRead(path)
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(hasher, file); err != nil {
+			fileInfo, err := file.Stat()
+			if err != nil {
 				_ = file.Close()
 				return err
+			}
+			if !fileInfo.Mode().IsRegular() {
+				_ = file.Close()
+				return &os.PathError{Op: "hash", Path: path, Err: fmt.Errorf("not a regular file")}
+			}
+			perm := fileInfo.Mode().Perm()
+			// Null-delimited header tags the type, executable state, and exact
+			// byte size; paths cannot contain null bytes, and the size makes each
+			// file's content self-delimiting so two trees cannot collide by
+			// shifting bytes across file boundaries.
+			header := fmt.Sprintf("%s\x00file\x00%04o\x00%d\x00", filepath.ToSlash(rel), perm, fileInfo.Size())
+			if _, err := io.WriteString(hasher, header); err != nil {
+				_ = file.Close()
+				return err
+			}
+			written, err := io.Copy(hasher, file)
+			if err != nil {
+				_ = file.Close()
+				return err
+			}
+			if written != fileInfo.Size() {
+				_ = file.Close()
+				return &os.PathError{Op: "hash", Path: path, Err: fmt.Errorf("file changed while hashing")}
 			}
 			if err := file.Close(); err != nil {
 				return err

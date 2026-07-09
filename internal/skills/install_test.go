@@ -117,6 +117,98 @@ func TestInstallCopiesLocalSkillAndRecordsHash(t *testing.T) {
 	}
 }
 
+// TestSwapDirIntoPlaceNoPriorInstall renames a staged dir into an absent target.
+func TestSwapDirIntoPlaceNoPriorInstall(t *testing.T) {
+	parent := t.TempDir()
+	staging := filepath.Join(parent, ".zero-skill-install-1")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, skillFileName), []byte("body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(parent, "skill")
+
+	if err := swapDirIntoPlace(staging, target); err != nil {
+		t.Fatalf("swapDirIntoPlace (no prior): %v", err)
+	}
+	if _, err := os.Stat(staging); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging dir should be consumed: %v", err)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("target should exist after swap: %v", err)
+	}
+}
+
+// TestSwapDirIntoPlaceReplacesExisting verifies a completed swap atomically
+// replaces the previous install (the old dir is gone, the new one is present).
+func TestSwapDirIntoPlaceReplacesExisting(t *testing.T) {
+	parent := t.TempDir()
+	staging := filepath.Join(parent, ".zero-skill-install-1")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, skillFileName), []byte("new body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(parent, "skill")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, skillFileName), []byte("old body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := swapDirIntoPlace(staging, target); err != nil {
+		t.Fatalf("swapDirIntoPlace (existing): %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(target, skillFileName))
+	if err != nil {
+		t.Fatalf("read swapped target: %v", err)
+	}
+	if string(data) != "new body" {
+		t.Fatalf("target content = %q, want %q", data, "new body")
+	}
+	// No leftover backup, and staging was consumed.
+	for _, path := range []string{staging, staging + ".old"} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected %s to be gone: %v", path, err)
+		}
+	}
+}
+
+// TestSwapDirIntoPlaceRollsBackOnFailure verifies that when the final swap fails
+// (here simulated by a missing staging dir, as a failed copy would leave), the
+// previous install is rolled back into place and an error is returned rather than
+// the old install being destroyed.
+func TestSwapDirIntoPlaceRollsBackOnFailure(t *testing.T) {
+	parent := t.TempDir()
+	target := filepath.Join(parent, "skill")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, skillFileName), []byte("old body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// staging does not exist: the final os.Rename(staging, target) will fail.
+	staging := filepath.Join(parent, ".zero-skill-install-missing")
+
+	if err := swapDirIntoPlace(staging, target); err == nil {
+		t.Fatalf("expected an error when the swap fails")
+	}
+	// The previous install must survive the failed swap.
+	data, err := os.ReadFile(filepath.Join(target, skillFileName))
+	if err != nil {
+		t.Fatalf("previous install lost during failed swap: %v", err)
+	}
+	if string(data) != "old body" {
+		t.Fatalf("previous install content = %q, want %q (rollback failed)", data, "old body")
+	}
+	if _, err := os.Stat(staging + ".old"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup should have been cleaned up: %v", err)
+	}
+}
+
 func TestInstallRejectsInvalidSkill(t *testing.T) {
 	destDir := t.TempDir()
 	// A source directory with no SKILL.md is not a valid skill.
