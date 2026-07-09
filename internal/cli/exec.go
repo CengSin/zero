@@ -510,6 +510,15 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 	// lspShutdown tears down any language-server sessions either half spawned.
 	selfCorrector, fileDiagnostics, lspShutdown := newExecSelfCorrector(options.selfCorrect, workspaceRoot, options.autonomy)
 	defer lspShutdown()
+	// Kept as a named variable (rather than inlined into Options below) because
+	// the write tools also use it for conflict checks across a run.
+	fileTracker := tools.NewFileTracker()
+	scratchBaseline := scratchFileSnapshot(workspaceRoot)
+	emitScratchWarning := func() {
+		if notice := scratchFileWarning(workspaceRoot, scratchBaseline); notice != "" {
+			writer.warning(notice)
+		}
+	}
 	result, err := agent.Run(runCtx, agentPrompt, provider, agent.Options{
 		MaxTurns:         resolved.MaxTurns,
 		ContextWindow:    resolveAgentContextWindow(runCtx, modelRegistry, resolved.Provider),
@@ -539,7 +548,7 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 		// if the model keeps stalling. The interactive TUI leaves this off.
 		RequireCompletionSignal: true,
 		Sandbox:                 sandboxEngine,
-		FileTracker:             tools.NewFileTracker(),
+		FileTracker:             fileTracker,
 		Hooks:                   newHookDispatcherWithExtra(workspaceRoot, pluginActivation.hooks),
 		EnabledTools:            options.enabledTools,
 		DisabledTools:           options.disabledTools,
@@ -598,6 +607,7 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 		return exitCrash
 	}
 	if err != nil {
+		emitScratchWarning()
 		// A Ctrl+C / SIGTERM cancellation is a clean shutdown, not a provider error.
 		if errors.Is(err, context.Canceled) || runCtx.Err() != nil {
 			sessionRecorder.append(sessions.EventError, map[string]any{"message": "interrupted"})
@@ -648,6 +658,10 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 	if notice := result.TruncationNotice(); notice != "" {
 		writer.warning(notice)
 	}
+	// Surface new scratch/debug-like files left untracked in git when we finish —
+	// including files created by shell commands that bypass the file tools (issue
+	// #551). Normal new deliverable files stay quiet to avoid warning fatigue.
+	emitScratchWarning()
 	// A headless run the completion gate marked INCOMPLETE (no-tool-call stall,
 	// self-reported non-completion, or max-turns cutoff) must NOT be reported as a
 	// success: exit 4 AND a machine-readable terminal event saying so. Handled per

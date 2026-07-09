@@ -25,6 +25,7 @@ import (
 	"github.com/Gitlawb/zero/internal/plugins"
 	"github.com/Gitlawb/zero/internal/providerhealth"
 	"github.com/Gitlawb/zero/internal/providermodeldiscovery"
+	"github.com/Gitlawb/zero/internal/provideroauth"
 	"github.com/Gitlawb/zero/internal/provideronboarding"
 	"github.com/Gitlawb/zero/internal/providers"
 	"github.com/Gitlawb/zero/internal/redaction"
@@ -60,6 +61,7 @@ type appDeps struct {
 	probeProviderHealth    func(context.Context, providerhealth.Options) providerhealth.Result
 	discoverProviderModels func(context.Context, config.ProviderProfile) ([]providermodeldiscovery.Model, error)
 	detectLocalRuntimes    func(context.Context, provideronboarding.LocalDetectOptions) []provideronboarding.DetectedLocalRuntime
+	openRouterLogin        func(context.Context, provideroauth.OpenRouterOptions) (string, error)
 	newSessionStore        func() *sessions.Store
 	loadPlugins            func(plugins.LoadOptions) (plugins.LoadResult, error)
 	loadHooks              func(hooks.LoadOptions) (hooks.LoadResult, error)
@@ -144,6 +146,7 @@ func defaultAppDeps() appDeps {
 		probeProviderHealth:    providerhealth.Probe,
 		discoverProviderModels: defaultDiscoverProviderModels,
 		detectLocalRuntimes:    provideronboarding.DetectLocalRuntimes,
+		openRouterLogin:        provideroauth.OpenRouterLogin,
 		newSessionStore: func() *sessions.Store {
 			return sessions.NewStore(sessions.StoreOptions{})
 		},
@@ -465,6 +468,9 @@ func fillAppDeps(deps appDeps) appDeps {
 	if deps.detectLocalRuntimes == nil {
 		deps.detectLocalRuntimes = defaults.detectLocalRuntimes
 	}
+	if deps.openRouterLogin == nil {
+		deps.openRouterLogin = defaults.openRouterLogin
+	}
 	if deps.newSessionStore == nil {
 		deps.newSessionStore = defaults.newSessionStore
 	}
@@ -553,6 +559,11 @@ func fillAppDeps(deps appDeps) appDeps {
 	userConfigPath := deps.userConfigPath
 	deps.newProvider = func(profile config.ProviderProfile) (zeroruntime.Provider, error) {
 		return baseNewProvider(applyStoredProviderKeyAt(profile, userConfigPath))
+	}
+	baseProbeProviderHealth := deps.probeProviderHealth
+	deps.probeProviderHealth = func(ctx context.Context, options providerhealth.Options) providerhealth.Result {
+		options.Profile = applyStoredProviderKeyAt(options.Profile, userConfigPath)
+		return baseProbeProviderHealth(ctx, options)
 	}
 	return deps
 }
@@ -735,6 +746,8 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 		Scope:         scope,
 	})
 	lastKnownMCPConfig := mcpConfig
+	fileTracker := tools.NewFileTracker()
+	var scratchBaseline scratchFileBaseline
 	sttServerManager := newDictationServerManager(resolved.STT)
 	// Keep STT downloads in the SAME config tree the rest of the TUI uses. Deriving
 	// from userConfigPath (rather than config.UserConfigDir()) matters when the config
@@ -764,12 +777,18 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 		NewProvider:          deps.newProvider,
 		ProbeProviderHealth:  deps.probeProviderHealth,
 		UserAgent:            userAgent(),
-		Registry:             registry,
-		SessionStore:         deps.newSessionStore(),
-		SandboxStore:         sandboxStore,
-		MCPConfig:            mcpConfig,
-		MCPPermissionStore:   mcpPermissionStore,
-		MCPTokenStore:        mcpTokenStore,
+		PrepareRunCompletionWarning: func() {
+			scratchBaseline = scratchFileSnapshot(workspaceRoot)
+		},
+		RunCompletionWarning: func() string {
+			return scratchFileWarning(workspaceRoot, scratchBaseline)
+		},
+		Registry:           registry,
+		SessionStore:       deps.newSessionStore(),
+		SandboxStore:       sandboxStore,
+		MCPConfig:          mcpConfig,
+		MCPPermissionStore: mcpPermissionStore,
+		MCPTokenStore:      mcpTokenStore,
 		MCPCommand: func(ctx context.Context, args []string) tui.MCPCommandResult {
 			if ctx == nil {
 				ctx = context.Background()
@@ -795,7 +814,7 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 			PermissionMode: permissionMode,
 			Autonomy:       "low",
 			Sandbox:        sandboxEngine,
-			FileTracker:    tools.NewFileTracker(),
+			FileTracker:    fileTracker,
 			Hooks:          newHookDispatcherWithExtra(workspaceRoot, pluginActivation.hooks),
 			DeferThreshold: resolved.Tools.DeferThreshold,
 			Specialists:    specialistRuntime.specialists,

@@ -361,7 +361,13 @@ func releasePlatform(goos string) (string, error) {
 	case "windows":
 		return "windows", nil
 	default:
-		return "", fmt.Errorf("unsupported release platform: %s", goos)
+		// No prebuilt release archive is published for this GOOS (e.g.
+		// Android/Termux). This does not mean the platform is unsupported --
+		// Termux runs zero fine via the npm wrapper -- it just has no
+		// self-updating release asset. Point users at `npm update` rather
+		// than a source rebuild, since that's the documented Termux
+		// install/upgrade path and doesn't require a Go toolchain.
+		return "", fmt.Errorf("no published release for %q (release assets: linux, macos, windows). Your build is the current version of record. Upgrade with `npm update -g @gitlawb/zero` to get the latest.", goos)
 	}
 }
 

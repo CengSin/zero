@@ -123,6 +123,7 @@ func TestPromptSubmitStoresReasoningSeparatelyFromAnswer(t *testing.T) {
 	})
 	base := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
 	times := []time.Time{
+		base, // burst tracker on Enter keypress (timing-based paste guard)
 		base, // run start: consumed by turnStartedAt (the working-line elapsed clock)
 		base,
 		base.Add(1 * time.Second),
@@ -1372,6 +1373,33 @@ func TestAgentResponseCompletesStuckPlan(t *testing.T) {
 			t.Error("a mid-plan ask_user yield must not force the plan complete")
 		}
 	})
+}
+
+func TestAgentResponseSurfacesRunCompletionWarning(t *testing.T) {
+	m := newModel(context.Background(), Options{
+		RunCompletionWarning: func() string { return "scratch warning" },
+	})
+	m.pending = true
+	m.activeRunID = 7
+	updated, _ := m.Update(agentResponseMsg{runID: 7, rows: []transcriptRow{{kind: rowAssistant, text: "done", final: true}}})
+	next := updated.(model)
+	if !transcriptContains(next.transcript, "scratch warning") {
+		t.Fatalf("expected run completion warning in transcript, got %#v", next.transcript)
+	}
+}
+
+func TestBeginRunPreparesRunCompletionWarningEachTurn(t *testing.T) {
+	prepares := 0
+	m := newModel(context.Background(), Options{
+		PrepareRunCompletionWarning: func() { prepares++ },
+	})
+
+	m = m.beginRun(nil)
+	m = m.beginRun(nil)
+
+	if prepares != 2 {
+		t.Fatalf("PrepareRunCompletionWarning called %d times, want once per run", prepares)
+	}
 }
 
 // TestToolResultDetailPrefersPreview: the card body uses the rich card-only
@@ -2673,5 +2701,141 @@ func TestOverlayViewportLinesCompositesAndPreservesBackdropText(t *testing.T) {
 	}
 	if !strings.Contains(panelRow, "backdrop") {
 		t.Fatalf("overlaid row should keep backdrop margin text alongside the panel, got %q", panelRow)
+	}
+}
+
+// burstTestModel creates a model with fake provider, advancing clock (60ms/tick),
+// and empty composer for burst/paste testing. termuxVersion controls the env var.
+func burstTestModel(t *testing.T, termuxVersion string) model {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	t.Setenv("TERMUX_VERSION", termuxVersion)
+	provider := &fakeProvider{events: []zeroruntime.StreamEvent{
+		{Type: zeroruntime.StreamEventText, Content: "ok"},
+		{Type: zeroruntime.StreamEventDone},
+	}}
+	m := newModel(context.Background(), Options{
+		Cwd:          t.TempDir(),
+		ProviderName: "tokenrouter",
+		ModelName:    "MiniMax-M3",
+		Provider:     provider,
+		Registry:     tools.NewRegistry(),
+	})
+	base := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	tick := 0
+	m.now = func() time.Time {
+		tick++
+		return base.Add(time.Duration(tick) * 60 * time.Millisecond)
+	}
+	m.input.SetValue("")
+	m.width = 100
+	m.height = 30
+	return m
+}
+
+// typeKeys simulates rapid keypresses into the model, returning the final state.
+func typeKeys(m model, keys string) model {
+	for _, ch := range keys {
+		updated, _ := m.Update(testKeyText(string(ch)))
+		m = updated.(model)
+	}
+	return m
+}
+
+// TestTermuxBurstInsertsNewline: under Termux, 3+ rapid chars + Enter inserts newline.
+func TestTermuxBurstInsertsNewline(t *testing.T) {
+	m := burstTestModel(t, "v0.118.0")
+	m = typeKeys(m, "abc")
+	updated, _ := m.Update(testKey(tea.KeyEnter))
+	m = updated.(model)
+	if m.pending {
+		t.Fatal("burst should insert newline, not submit")
+	}
+	if !strings.Contains(m.composerValue(), "\n") {
+		t.Fatalf("burst should insert newline into composer, got %q", m.composerValue())
+	}
+}
+
+// TestTermuxFastTypingSubmits: under Termux, 2 fast chars + Enter still submits.
+func TestTermuxFastTypingSubmits(t *testing.T) {
+	m := burstTestModel(t, "v0.118.0")
+	m = typeKeys(m, "ab")
+	updated, cmd := m.Update(testKey(tea.KeyEnter))
+	m = updated.(model)
+	if !m.pending {
+		t.Fatal("fast typing should be pending after submit")
+	}
+	if cmd == nil {
+		t.Fatal("fast typing should submit, got nil cmd")
+	}
+}
+
+// TestDesktopBurstNotAffected: on desktop (no TERMUX_VERSION), 3 fast chars + Enter submits.
+func TestDesktopBurstNotAffected(t *testing.T) {
+	m := burstTestModel(t, "")
+	m = typeKeys(m, "abc")
+	updated, cmd := m.Update(testKey(tea.KeyEnter))
+	m = updated.(model)
+	if !m.pending {
+		t.Fatal("desktop burst should be pending after submit")
+	}
+	if cmd == nil {
+		t.Fatal("desktop burst should submit, got nil cmd")
+	}
+}
+
+// TestBurstResetAfterSubmit: after submit, burstCount is reset so normal
+// typing (2 chars + Enter) still submits without false newline insertion.
+func TestBurstResetAfterSubmit(t *testing.T) {
+	m := burstTestModel(t, "v0.118.0")
+	// Type and submit normally
+	m = typeKeys(m, "hi")
+	updated, cmd := m.Update(testKey(tea.KeyEnter))
+	m = updated.(model)
+	if cmd == nil {
+		t.Fatal("first submit should start a run")
+	}
+	// Process the agent response so the model is no longer pending
+	resp, _ := m.Update(execCmd(cmd))
+	m = resp.(model)
+	if m.pending {
+		t.Fatal("model should not be pending after agent response")
+	}
+
+	// Reset lastKeyTime so the burst tracker sees a clean gap before the
+	// second round of typing — avoids coupling to fake-clock progression.
+	m.lastKeyTime = time.Time{}
+
+	// After reset, 2 fast chars + Enter should still submit (burstCount < 3)
+	m = typeKeys(m, "ok")
+	updated, cmd = m.Update(testKey(tea.KeyEnter))
+	m = updated.(model)
+	if !m.pending {
+		t.Fatal("after burst reset, fast typing should submit")
+	}
+	if cmd == nil {
+		t.Fatal("after burst reset, got nil cmd")
+	}
+}
+
+// TestMultilineBurstSubmits: with a \n already in the composer, a 2-char
+// burst + Enter on desktop should still submit (burstCount < 3), not
+// insert another newline.
+func TestMultilineBurstSubmits(t *testing.T) {
+	m := burstTestModel(t, "")
+	// Seed the composer with multiline text via applyComposerKey
+	m.composerActive = true
+	m.composer.text = "hello\nwor"
+	m.composer.cursor = len([]rune(m.composer.text))
+	m.input.SetValue(m.composer.text)
+
+	// Type "ld" fast (2 chars) then Enter
+	m = typeKeys(m, "ld")
+	updated, cmd := m.Update(testKey(tea.KeyEnter))
+	m = updated.(model)
+	if !m.pending {
+		t.Fatal("multiline burst should submit, not insert newline")
+	}
+	if cmd == nil {
+		t.Fatal("multiline burst got nil cmd")
 	}
 }

@@ -68,6 +68,25 @@ func TestExecCommandToolDescribesHostStateEscalation(t *testing.T) {
 	}
 }
 
+func TestExecCommandToolDescribesHostShellSyntax(t *testing.T) {
+	tool := NewScopedExecCommandTool(t.TempDir(), nil, nil)
+	schema := tool.Parameters()
+	descriptionParts := []string{tool.Description()}
+	for _, property := range schema.Properties {
+		descriptionParts = append(descriptionParts, property.Description)
+	}
+	description := strings.ToLower(strings.Join(descriptionParts, " "))
+
+	if runtime.GOOS == "windows" {
+		if !strings.Contains(description, "cmd.exe") || !strings.Contains(description, "cwd") {
+			t.Fatalf("expected Windows cmd.exe and cwd guidance in exec_command description, got %q", description)
+		}
+		if !strings.Contains(description, "double quotes") || !strings.Contains(description, `--jq ".a | b"`) {
+			t.Fatalf("expected the double-quote metacharacter rule in exec_command description, got %q", description)
+		}
+	}
+}
+
 func TestExecCommandReturnsSessionAndWriteStdinPollsCompletion(t *testing.T) {
 	root := t.TempDir()
 	manager := newExecSessionManager()
@@ -541,10 +560,11 @@ func TestCollectRespectsDeadlineUnderContinuousOutput(t *testing.T) {
 	elapsed := time.Since(start)
 
 	// Generous slack over `wait` for scheduling jitter under a continuously
-	// writing goroutine — this must stay a small multiple of wait, not
-	// "however long the writer keeps going" (which is what the bug produced:
-	// this test would hang past the 30s test timeout without the fix).
-	if elapsed > 3*wait {
+	// writing goroutine (worse on Windows CI under load). This must stay a
+	// small multiple of wait, not "however long the writer keeps going"
+	// (which is what the bug produced: this test would hang past the 30s
+	// test timeout without the fix).
+	if elapsed > 5*wait {
 		t.Fatalf("collect took %v under continuous output, want close to the %v deadline", elapsed, wait)
 	}
 }

@@ -39,6 +39,8 @@ type Options struct {
 	DiscoverProviderModels      func(context.Context, config.ProviderProfile) ([]providermodeldiscovery.Model, error)
 	DiscoverOllamaContextWindow func(ctx context.Context, baseURL string, model string) (int, error)
 	RuntimeMessageSink          func(tea.Msg)
+	PrepareRunCompletionWarning func()
+	RunCompletionWarning        func() string
 	Registry                    *tools.Registry
 	SessionStore                *sessions.Store
 	SandboxStore                *sandbox.GrantStore

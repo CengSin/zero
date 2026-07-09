@@ -137,6 +137,20 @@ func discoverAuthorizationServer(ctx context.Context, client *http.Client, baseU
 // overrides. Configured endpoints take precedence over discovered ones, and act
 // as a fallback when discovery fails or omits a value.
 func resolveAuthorizationServer(ctx context.Context, client *http.Client, baseURL string, cfg OAuthConfig) (authServerMetadata, error) {
+	// When the config supplies both the authorization and token endpoints
+	// directly, skip network discovery entirely: there is nothing to discover,
+	// and a hung/blocked discovery call (e.g. offline, or an unreachable issuer
+	// in tests) must not gate an otherwise fully-specified login. Discovery stays
+	// the fallback for any endpoint the config leaves blank.
+	if strings.TrimSpace(cfg.AuthorizationEndpoint) != "" && strings.TrimSpace(cfg.TokenEndpoint) != "" {
+		metadata := authServerMetadata{
+			AuthorizationEndpoint: strings.TrimSpace(cfg.AuthorizationEndpoint),
+			TokenEndpoint:         strings.TrimSpace(cfg.TokenEndpoint),
+			RegistrationEndpoint:  strings.TrimSpace(cfg.RegistrationEndpoint),
+		}
+		return metadata, nil
+	}
+
 	discoveryBase := strings.TrimSpace(cfg.IssuerURL)
 	if discoveryBase == "" {
 		discoveryBase = baseURL

@@ -82,6 +82,10 @@ func (tool applyPatchTool) RunWithOptions(ctx context.Context, args map[string]a
 	if err := recheckPatchWriteTargets(applyRoot, patch); err != nil {
 		return errorResult("Error applying patch: " + err.Error())
 	}
+	var createdTargets []string
+	if options.FileTracker != nil {
+		createdTargets = missingPatchTargets(applyRoot, patch)
+	}
 
 	command := exec.CommandContext(ctx, "git", "apply", "--whitespace=nowarn", patchPath)
 	command.Dir = applyRoot
@@ -110,7 +114,42 @@ func (tool applyPatchTool) RunWithOptions(ctx context.Context, args map[string]a
 			options.FileTracker.Forget(absolute)
 		}
 	}
+	recordCreatedPatchTargets(options.FileTracker, createdTargets)
 	return result
+}
+
+func missingPatchTargets(root string, patch string) []string {
+	seen := map[string]bool{}
+	var missing []string
+	for _, path := range patchHeaderPaths(patch) {
+		if path == "" || path == "/dev/null" {
+			continue
+		}
+		absolute, _, err := resolveWorkspaceTargetPath(root, path)
+		if err != nil || seen[absolute] {
+			continue
+		}
+		seen[absolute] = true
+		if _, err := os.Stat(absolute); os.IsNotExist(err) {
+			missing = append(missing, absolute)
+		}
+	}
+	return missing
+}
+
+func recordCreatedPatchTargets(tracker *FileTracker, missingBefore []string) {
+	if tracker == nil {
+		return
+	}
+	for _, absolute := range missingBefore {
+		if _, err := os.Stat(absolute); err != nil {
+			continue
+		}
+		if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+			absolute = resolved
+		}
+		tracker.RecordCreated(absolute)
+	}
 }
 
 // changedFilesFromPatch extracts the unique, WORKSPACE-relative paths a patch
