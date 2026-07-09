@@ -147,7 +147,7 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 	// so a failed copy (full disk, permission denied) leaves the previously
 	// installed skill and its lockfile entry completely intact instead of
 	// wiping them and stranding the lockfile pointing at a deleted directory.
-	staging, err := os.MkdirTemp(filepath.Dir(dir), ".zero-skill-install-")
+	staging, err := os.MkdirTemp(dir, ".zero-skill-install-")
 	if err != nil {
 		return InstallResult{}, fmt.Errorf("create staging dir: %w", err)
 	}
