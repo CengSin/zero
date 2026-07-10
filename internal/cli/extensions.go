@@ -205,7 +205,9 @@ func runMCPLegacyList(args []string, stdout io.Writer, stderr io.Writer, deps ap
 	if err != nil {
 		return writeAppError(stderr, "failed to resolve workspace: "+err.Error(), exitCrash)
 	}
-	cfg, err := deps.resolveMCPConfig(cwd)
+	// Enumeration for the extensions listing, never spawns a server, so it is left
+	// ungated (excludeProject=false) like the other doctor/status report sites.
+	cfg, err := deps.resolveMCPConfig(cwd, false)
 	if err != nil {
 		return writeAppError(stderr, redaction.ErrorMessage(err, redaction.Options{}), exitCrash)
 	}
@@ -286,11 +288,21 @@ func runMCPTools(ctx context.Context, args []string, stdout io.Writer, stderr io
 			return writeAppError(stderr, "failed to resolve workspace: "+err.Error(), exitCrash)
 		}
 		registry := tools.NewRegistry()
-		mcpRuntime, err := registerMCPToolsForWorkspace(ctx, cwd, registry, deps, mcp.AutonomyLow)
+		// `mcp tools list` connects to (spawns) each server to enumerate its live tools,
+		// so it is a spawn site and gates the project layer behind the trust check. No
+		// --worktree reassignment on this command path, so trustRoot == cwd.
+		mcpRuntime, mcpSkip, err := registerMCPToolsForWorkspace(ctx, cwd, registry, deps, mcp.AutonomyLow, cwd)
 		if err != nil {
 			return writeAppError(stderr, redaction.ErrorMessage(err, redaction.Options{}), exitCrash)
 		}
 		defer closeMCPRuntime(stderr, mcpRuntime)
+		// Surface the trust skip on stderr so an empty (or short) list in an untrusted
+		// workspace is explained rather than read as "nothing configured". The notice
+		// goes to stderr, leaving the list (text or --json) on stdout intact.
+		emitTrustNotice(stderr, mcpSkip)
+		// Surface the trust skip on stderr so an empty (or short) list in an untrusted
+		// workspace is explained rather than read as "nothing configured". The notice
+		// goes to stderr, leaving the list (text or --json) on stdout intact.
 		items := mcpToolList(registry)
 		if options.json {
 			payload := struct {

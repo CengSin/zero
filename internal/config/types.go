@@ -398,6 +398,11 @@ type ResolveOptions struct {
 	ProviderCommand   string
 	Env               map[string]string
 	Overrides         Overrides
+	// ExcludeProject drops the project config layer (ProjectConfigPath) from MCP
+	// resolution when the workspace is untrusted, so a cloned repo's ./.zero/config.json
+	// cannot spawn stdio MCP servers. It is fail-closed: only a trusted workspace sets
+	// it false. Mirrors the ExcludeProject option hooks and plugins already honor.
+	ExcludeProject bool
 }
 
 type Overrides struct {
@@ -435,16 +440,19 @@ type MCPConfig struct {
 }
 
 type MCPServerConfig struct {
-	Type        string            `json:"type,omitempty"`
-	Command     string            `json:"command,omitempty"`
-	Args        []string          `json:"args,omitempty"`
-	Env         map[string]string `json:"env,omitempty"`
-	URL         string            `json:"url,omitempty"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	Auth        string            `json:"auth,omitempty"`
-	OAuth       *MCPOAuthConfig   `json:"oauth,omitempty"`
-	Disabled    bool              `json:"disabled,omitempty"`
-	disabledSet bool
+	Type     string            `json:"type,omitempty"`
+	Command  string            `json:"command,omitempty"`
+	Args     []string          `json:"args,omitempty"`
+	Env      map[string]string `json:"env,omitempty"`
+	URL      string            `json:"url,omitempty"`
+	Headers  map[string]string `json:"headers,omitempty"`
+	Auth     string            `json:"auth,omitempty"`
+	OAuth    *MCPOAuthConfig   `json:"oauth,omitempty"`
+	Disabled bool              `json:"disabled,omitempty"`
+	// ProjectConfigured marks servers touched by project config. It is runtime
+	// metadata, not persisted config.
+	ProjectConfigured bool `json:"-"`
+	disabledSet       bool
 	// configured is true when the user's config JSON declared an object for
 	// this server at all (i.e. UnmarshalJSON ran for it), regardless of which
 	// fields it set or what values they hold. A built-in default seeded by

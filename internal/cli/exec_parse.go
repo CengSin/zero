@@ -30,6 +30,8 @@ func parseExecArgs(args []string) (execOptions, bool, error) {
 			options.selfCorrect = true
 		case arg == "--no-notify":
 			options.noNotify = true
+		case arg == "--no-completion-gate":
+			options.noCompletionGate = true
 		case arg == "--notify":
 			value, next, err := nextFlagValue(args, index, arg)
 			if err != nil {
@@ -401,6 +403,11 @@ func parseExecArgs(args []string) (execOptions, bool, error) {
 		// so accepting the flag here would silently ignore it. Reject the combination
 		// rather than pretend it took effect.
 		return options, false, execUsageError{"--self-correct cannot be combined with --use-spec."}
+	}
+	if options.useSpec && options.noCompletionGate {
+		// Same reasoning as --self-correct above: the spec-draft path never consults
+		// the completion gate, so the flag would be silently ignored.
+		return options, false, execUsageError{"--no-completion-gate cannot be combined with --use-spec."}
 	}
 	if !options.useSpec && options.specModel != "" {
 		return options, false, execUsageError{"--spec-model requires --use-spec."}

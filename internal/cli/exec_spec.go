@@ -21,11 +21,19 @@ import (
 )
 
 type execSpecDraftRun struct {
-	options            execOptions
-	stdout             io.Writer
-	stderr             io.Writer
-	deps               appDeps
-	workspaceRoot      string
+	options       execOptions
+	stdout        io.Writer
+	stderr        io.Writer
+	deps          appDeps
+	workspaceRoot string
+	// trustRoot is the ORIGINAL launch directory (captured before any --worktree
+	// reassignment), so a --use-spec run inside a --worktree of a trusted repo
+	// still keys the trust check on the source repo, not the generated worktree path.
+	trustRoot string
+	// mcpSkip is the trust verdict from the workspace MCP registration in runExec
+	// (which runs before this spec-draft path), so the spec-draft notice can report a
+	// dropped project MCP layer instead of leaving it silent.
+	mcpSkip            trustSkip
 	registry           *tools.Registry
 	modelRegistry      modelregistry.Registry
 	resolved           config.ResolvedConfig
@@ -96,6 +104,13 @@ func runExecSpecDraft(run execSpecDraftRun) int {
 	var draftInfo execSpecDraftInfo
 	runCtx, stopSignals := signalContext()
 	defer stopSignals()
+	// The spec-draft path activates no plugins, so the plugin skip is omitted. Trust
+	// keys on run.trustRoot (the original launch dir), not run.workspaceRoot, which
+	// may be a --worktree path; this keeps a --use-spec --worktree run of a trusted
+	// repo trusted. Emit at most one notice when project hooks or the project MCP
+	// layer (registered earlier in runExec, carried in run.mcpSkip) were dropped.
+	hookDispatcher, hookSkip := newHookDispatcher(run.workspaceRoot, run.trustRoot)
+	emitTrustNotice(run.stderr, hookSkip, run.mcpSkip)
 	result, err := agent.Run(runCtx, run.prompt, run.provider, agent.Options{
 		MaxTurns:        run.resolved.MaxTurns,
 		ContextWindow:   resolveAgentContextWindow(runCtx, run.modelRegistry, run.resolved.Provider),
@@ -112,7 +127,7 @@ func runExecSpecDraft(run execSpecDraftRun) int {
 		Autonomy:        "low",
 		Sandbox:         run.sandboxEngine,
 		FileTracker:     tools.NewFileTracker(),
-		Hooks:           newHookDispatcher(run.workspaceRoot),
+		Hooks:           hookDispatcher,
 		EnabledTools:    run.options.enabledTools,
 		DisabledTools:   run.options.disabledTools,
 		OnText:          writer.text,

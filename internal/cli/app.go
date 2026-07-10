@@ -51,7 +51,7 @@ type appDeps struct {
 	stdin            io.Reader
 	userConfigPath   func() (string, error)
 	resolveConfig    func(workspaceRoot string, overrides config.Overrides) (config.ResolvedConfig, error)
-	resolveMCPConfig func(workspaceRoot string) (config.MCPConfig, error)
+	resolveMCPConfig func(workspaceRoot string, excludeProject bool) (config.MCPConfig, error)
 	newProvider      func(config.ProviderProfile) (zeroruntime.Provider, error)
 	// exportActiveProvider pins spawned children to the run's provider (production:
 	// config.SetActiveProviderEnv, set in defaultAppDeps — deliberately NOT filled
@@ -125,11 +125,12 @@ func defaultAppDeps() appDeps {
 			options.Overrides = overrides
 			return config.Resolve(options)
 		},
-		resolveMCPConfig: func(workspaceRoot string) (config.MCPConfig, error) {
+		resolveMCPConfig: func(workspaceRoot string, excludeProject bool) (config.MCPConfig, error) {
 			options, err := config.DefaultResolveOptions(workspaceRoot)
 			if err != nil {
 				return config.MCPConfig{}, err
 			}
+			options.ExcludeProject = excludeProject
 			return config.ResolveMCP(options)
 		},
 		newProvider: func(profile config.ProviderProfile) (zeroruntime.Provider, error) {
@@ -406,6 +407,8 @@ func runWithDeps(args []string, stdout io.Writer, stderr io.Writer, deps appDeps
 		return runWorktrees(args[1:], stdout, stderr, deps)
 	case "verify":
 		return runVerifyCommand(args[1:], stdout, stderr, deps)
+	case "trust":
+		return runTrust(args[1:], stdout, stderr, deps)
 	case "eval":
 		return runAgentEvalCommand(args[1:], stdout, stderr, deps)
 	case "changes", "change":
@@ -669,7 +672,17 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 		return writeAppError(stderr, "failed to initialize specialist tools: "+err.Error(), 1)
 	}
 	defer closeSpecialistRuntime(stderr, specialistRuntime)
-	mcpConfig, err := deps.resolveMCPConfig(workspaceRoot)
+	// The TUI has no --worktree reassignment, so trustRoot == workspaceRoot here.
+	// Gate the project MCP layer behind the workspace-trust check (fail-closed): an
+	// untrusted workspace must not spawn its ./.zero/config.json stdio MCP servers.
+	// Keep the store-read error so the notice below can distinguish a fail-closed
+	// store error from a clean untrusted verdict.
+	mcpExcludeProject, mcpTrustErrored := resolveTrust(workspaceRoot)
+	mcpSkip := trustSkip{
+		excludedProjectConfig: mcpExcludeProject && projectMCPConfigExists(workspaceRoot),
+		trustCheckErrored:     mcpTrustErrored,
+	}
+	mcpConfig, err := deps.resolveMCPConfig(workspaceRoot, mcpExcludeProject)
 	if err != nil {
 		return writeAppError(stderr, err.Error(), 1)
 	}
@@ -711,7 +724,10 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 	// collect their hooks + skill roots for the dispatcher and skill tool below.
 	// Done after specialist + MCP registration so plugin tools are part of the
 	// deferral count, and it fails OPEN — a malformed plugin is warned and skipped.
-	pluginActivation := activatePlugins(workspaceRoot, registry, deps, stderr)
+	// The interactive TUI is not worktree-reassigned, so the trust root is the
+	// launch directory itself.
+	trustRoot := workspaceRoot
+	pluginActivation := activatePlugins(workspaceRoot, registry, deps, stderr, trustRoot)
 	// Ask (not Auto) is the interactive default: in Auto, ToolAdvertised exposes
 	// only PermissionAllow tools, so prompt-gated tools (write_file/edit_file/bash/
 	// apply_patch) would never be offered to the model — the TUI could neither edit
@@ -758,6 +774,11 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 	if userConfigPath != "" {
 		sttDownloadRoot = filepath.Join(filepath.Dir(userConfigPath), "stt")
 	}
+	// Build the hooks dispatcher out of the AgentOptions literal so its trust skip
+	// report can be combined with the plugin activation's, and emit at most one
+	// notice when project hooks/plugins were dropped for an untrusted workspace.
+	hookDispatcher, hookSkip := newHookDispatcherWithExtra(workspaceRoot, pluginActivation.hooks, trustRoot)
+	emitTrustNotice(stderr, hookSkip, pluginActivation.trustSkip, mcpSkip)
 	return deps.runTUI(context.Background(), tui.Options{
 		Cwd:                  workspaceRoot,
 		Version:              version,
@@ -796,7 +817,7 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 			var stdout, stderr bytes.Buffer
 			exitCode := runMCPWithContext(ctx, args, &stdout, &stderr, deps)
 			nextConfig := lastKnownMCPConfig
-			if refreshed, err := deps.resolveMCPConfig(workspaceRoot); err == nil {
+			if refreshed, err := deps.resolveMCPConfig(workspaceRoot, mcpExcludeProject); err == nil {
 				lastKnownMCPConfig = refreshed
 				nextConfig = refreshed
 			}
@@ -815,7 +836,7 @@ func runInteractiveTUIWithSetup(stderr io.Writer, deps appDeps, permissionMode a
 			Autonomy:       "low",
 			Sandbox:        sandboxEngine,
 			FileTracker:    fileTracker,
-			Hooks:          newHookDispatcherWithExtra(workspaceRoot, pluginActivation.hooks),
+			Hooks:          hookDispatcher,
 			DeferThreshold: resolved.Tools.DeferThreshold,
 			Specialists:    specialistRuntime.specialists,
 			Skills:         pluginActivation.skillInfos(deps.skillsDir()),
@@ -1326,6 +1347,8 @@ Flags:
       --notify <off|bell|notify|both>
                                     Override notification mode for this run
       --no-notify                   Disable notifications for this run
+      --no-completion-gate          Accept a no-tool-call reply as final without the INCOMPLETE
+                                    downgrade (for conversational callers with an operator present)
 `)
 	return err
 }

@@ -110,6 +110,16 @@ type execOptions struct {
 	notifyMode string
 	// noNotify forces ModeOff for this run. Mutually exclusive with notifyMode.
 	noNotify bool
+	// noCompletionGate turns off the headless completion gate
+	// (agent.Options.RequireCompletionSignal) for this run. It exists for
+	// CONVERSATIONAL exec callers — a chat frontend driving exec with an operator
+	// present to reply (e.g. zeroclaw chat). There, a final message that hands
+	// the turn back ("the sandbox blocks network egress, approve it and I'll
+	// continue") is a COMPLETE answer, not an unfinished task, so the gate's
+	// self-report admission check and INCOMPLETE downgrade (exit 4) would only
+	// mislabel honest blocker reports. Default off: plain `zero exec` keeps the
+	// gate, preserving CI/cron semantics.
+	noCompletionGate bool
 	// addDirs holds directories passed via --add-dir that should be allowed as
 	// additional write roots for this run. Unioned with
 	// config.SandboxConfig.AdditionalWriteRoots at scope construction time.
@@ -155,6 +165,10 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 	if err != nil {
 		return writeExecFormatUsageError(stdout, stderr, options.outputFormat, err.Error())
 	}
+	// trustRoot is the ORIGINAL launch directory, captured before any --worktree
+	// reassignment below, so a worktree of a trusted repo inherits that repo's
+	// trust instead of being seen as a fresh untrusted path.
+	trustRoot := workspaceRoot
 	if options.worktree {
 		preparedWorktree, err := deps.prepareWorktree(context.Background(), worktrees.Options{
 			Cwd:     workspaceRoot,
@@ -201,7 +215,7 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 	if options.useSpec {
 		permissionMode = agent.PermissionModeSpecDraft
 	}
-	mcpRuntime, err := registerMCPToolsForWorkspace(context.Background(), workspaceRoot, registry, deps, execMCPAutonomy(options))
+	mcpRuntime, mcpSkip, err := registerMCPToolsForWorkspace(context.Background(), workspaceRoot, registry, deps, execMCPAutonomy(options), trustRoot)
 	if err != nil {
 		return writeExecProviderError(stdout, stderr, options.outputFormat, "mcp_error", err.Error())
 	}
@@ -210,7 +224,7 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 	// registry and collect their hooks + skill roots for the dispatcher and skill
 	// tool below. Done before --list-tools and filter validation so plugin tools
 	// are listable and filter-validatable; it fails OPEN (a bad plugin is skipped).
-	pluginActivation := activatePlugins(workspaceRoot, registry, deps, stderr)
+	pluginActivation := activatePlugins(workspaceRoot, registry, deps, stderr, trustRoot)
 	if options.useSpec {
 		specmode.RegisterDraftTools(registry, workspaceRoot, deps.now)
 	}
@@ -415,6 +429,8 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 			stderr:             stderr,
 			deps:               deps,
 			workspaceRoot:      workspaceRoot,
+			trustRoot:          trustRoot,
+			mcpSkip:            mcpSkip,
 			registry:           registry,
 			modelRegistry:      modelRegistry,
 			resolved:           resolved,
@@ -519,6 +535,11 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 			writer.warning(notice)
 		}
 	}
+	// Build the hooks dispatcher out of the struct literal so its trust skip report
+	// can be combined with the plugin activation's, and emit at most one notice when
+	// project hooks/plugins were dropped for an untrusted workspace.
+	hookDispatcher, hookSkip := newHookDispatcherWithExtra(workspaceRoot, pluginActivation.hooks, trustRoot)
+	emitTrustNotice(stderr, hookSkip, pluginActivation.trustSkip, mcpSkip)
 	result, err := agent.Run(runCtx, agentPrompt, provider, agent.Options{
 		MaxTurns:         resolved.MaxTurns,
 		ContextWindow:    resolveAgentContextWindow(runCtx, modelRegistry, resolved.Provider),
@@ -545,11 +566,13 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 		// Headless exec: don't accept a no-tool-call turn as "done" while work
 		// clearly remains (pending plan items / a mid-step continuation cue) —
 		// nudge to continue, and finalize as INCOMPLETE rather than false success
-		// if the model keeps stalling. The interactive TUI leaves this off.
-		RequireCompletionSignal: true,
+		// if the model keeps stalling. The interactive TUI leaves this off, and
+		// --no-completion-gate lets conversational exec callers (a chat frontend
+		// with an operator present) opt out the same way.
+		RequireCompletionSignal: !options.noCompletionGate,
 		Sandbox:                 sandboxEngine,
 		FileTracker:             fileTracker,
-		Hooks:                   newHookDispatcherWithExtra(workspaceRoot, pluginActivation.hooks),
+		Hooks:                   hookDispatcher,
 		EnabledTools:            options.enabledTools,
 		DisabledTools:           options.disabledTools,
 		OnText:                  writer.text,
