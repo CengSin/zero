@@ -3,60 +3,42 @@
 package fscopy
 
 import (
-	"fmt"
 	"os"
 )
 
-// openRegularRead opens a file for reading. On platforms without O_NOFOLLOW
-// (!unix && !windows: Plan 9, WASM) we cannot atomically refuse a symlink at
-// open time. We reject a final-component symlink with Lstat before opening, and
-// the caller (CopyFile, HashTree) additionally fstat's the opened descriptor
-// and refuses anything that is not a regular file, so a link swapped into the
-// path after this check still cannot be silently followed.
+// No no-follow primitive exists on this platform (the file only compiles where
+// //go:build !unix && !windows holds, i.e. Plan 9 and WASM). The sibling files
+// open_unix.go (O_NOFOLLOW) and open_windows.go (FILE_FLAG_OPEN_REPARSE_POINT)
+// use the platform-native no-follow primitive; this file is the "no native
+// no-follow" branch of that dispatch.
+//
+// Per the no-follow contract — "if a native no-follow primitive is available,
+// use it; otherwise fail closed rather than best-effort" — both helpers here
+// refuse to open. The earlier TOCTOU-narrowing approach (Lstat before/after a
+// plain open, or an O_TRUNC-free write plus a post-open fd fstat) reduced but
+// did NOT close the race: with no atomic open-time refusal of a final-component
+// symlink, an attacker can swap a symlink into the path between the check and
+// the open, and the truncation (or the followed read through the link's target)
+// lands before any post-open re-check can refuse it. Fail closed: never open,
+// never truncate, never follow. An install/hashing operation that cannot
+// guarantee a no-follow open is not safe to run on these targets.
+
+// openRegularRead opens a regular file for reading without following a final
+// symlink. No no-follow primitive is available on this platform, so it fails
+// closed rather than risk following a swapped-in symlink.
 func openRegularRead(path string) (*os.File, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrInvalid}
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	// Post-open re-check: if a symlink was swapped in between our Lstat and
-	// os.Open, the fd may now reference the link's target. Close and reject.
-	if info2, err := os.Lstat(path); err == nil && info2.Mode()&os.ModeSymlink != 0 {
-		_ = f.Close()
-		return nil, &os.PathError{Op: "open", Path: path, Err: fmt.Errorf("symlink detected after open")}
-	}
-	return f, nil
+	return nil, &os.PathError{Op: "open", Path: path, Err: errNoNoFollow}
 }
 
-// openRegularWrite creates or truncates a file for writing. On platforms
-// without O_NOFOLLOW (!unix && !windows) we cannot atomically refuse a symlink
-// at open time. We perform a two-phase Lstat check (before and after open) to
-// narrow the TOCTOU window: if an attacker swaps a symlink into the path
-// between the first check and the open, the second check catches it. The
-// race window between os.Open and the post-open Lstat still exists but is much
-// smaller than a single-check approach. On Windows and Unix, the sibling files
-// open_windows.go and open_unix.go use true no-follow opens that eliminate the
-// race entirely.
+// openRegularWrite creates or truncates a regular file for writing without
+// following a final symlink. No no-follow primitive is available on this
+// platform, so it fails closed rather than risk truncating a swapped-in symlink
+// target (an irreversible operation) or writing into one.
 func openRegularWrite(path string, perm uint32) (*os.File, error) {
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrInvalid}
-	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.FileMode(perm))
-	if err != nil {
-		return nil, err
-	}
-	// Post-open re-check: if a symlink was swapped in between our Lstat and
-	// os.OpenFile, we may have opened (and truncated) the wrong file. Close
-	// and report rather than write data into the symlink target.
-	if info2, err := os.Lstat(path); err == nil && info2.Mode()&os.ModeSymlink != 0 {
-		_ = f.Close()
-		return nil, &os.PathError{Op: "open", Path: path, Err: fmt.Errorf("symlink detected after open")}
-	}
-	return f, nil
+	return nil, &os.PathError{Op: "open", Path: path, Err: errNoNoFollow}
 }
+
+// errNoNoFollow is the closed failure returned when no platform-native
+// no-follow open primitive is available. It is a sentinel so callers/tests can
+// distinguish "unsupported target" from an ordinary I/O error.
+var errNoNoFollow = os.ErrInvalid

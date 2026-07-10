@@ -91,19 +91,44 @@ func FormatOutput(skill Skill) string {
 	// Truncate on a UTF-8 rune boundary so we never emit a split multi-byte
 	// rune to the provider, then append the truncation note. The note itself is
 	// ASCII, so it cannot introduce an invalid rune.
-	cut := maxSkillOutputSize - len(truncationNote)
-	if cut < 0 {
-		cut = 0
+	//
+	// The closing frame ("\n</skill>") is reserved out of the ceiling and ALWAYS
+	// emitted, so a body longer than the cap still leaves the document
+	// well-formed instead of dropping the end tag (the doc promises the closing
+	// tags stay intact). The final output must satisfy
+	// len(output[:cut]) + len(note) + len(closeFrame) <= maxSkillOutputSize, so the
+	// cut ceiling already accounts for the note and frame. The cut is floored at
+	// the opening tag's length so it can never retreat into "<skill ...>\n" — the
+	// bug where a single-line body (no internal newline) collapsed the whole
+	// output to just the opening tag plus the note, erasing every instruction
+	// byte. Line snapping is applied within the body slice ONLY when it keeps at
+	// least one body byte; otherwise the rune-bounded cut is kept so content
+	// survives.
+	const closeFrame = "\n</skill>"
+	openTagLen := len(fmt.Sprintf("<skill name=%q dir=%q>\n", skill.Name, skill.Dir))
+	ceiling := maxSkillOutputSize - len(truncationNote) - len(closeFrame)
+	if ceiling < openTagLen {
+		ceiling = openTagLen
 	}
-	for cut > 0 && !utf8.RuneStart(output[cut]) {
+	cut := ceiling
+	if cut > len(output) {
+		cut = len(output)
+	}
+	for cut > openTagLen && !utf8.RuneStart(output[cut]) {
 		cut--
 	}
-	// Land the cut on a line boundary (newline) so we never leave a partial
-	// asset line; back up to the most recent newline at or before cut.
-	if nl := strings.LastIndexByte(output[:cut], '\n'); nl >= 0 {
-		cut = nl + 1
+	if cut > openTagLen {
+		if nl := strings.LastIndexByte(output[openTagLen:cut], '\n'); nl >= 0 {
+			cut = openTagLen + nl + 1
+		}
 	}
-	return output[:cut] + truncationNote
+	if cut < openTagLen {
+		cut = openTagLen
+	}
+	if cut > len(output) {
+		cut = len(output)
+	}
+	return output[:cut] + truncationNote + closeFrame
 }
 
 // humanSize formats a byte count as a human-readable string.

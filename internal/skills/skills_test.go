@@ -450,12 +450,56 @@ func TestFormatOutputTruncatesOnRuneBoundary(t *testing.T) {
 		t.Fatalf("expected 1 skill, got %d", len(loaded))
 	}
 	out := FormatOutput(loaded[0])
-	if !strings.HasSuffix(out, "\n(output truncated)") {
-		t.Fatalf("expected truncation note at end, got suffix %q", out[len(out)-60:])
+	if !strings.HasSuffix(out, "\n(output truncated)\n</skill>") {
+		t.Fatalf("expected truncation note + closing frame at end, got suffix %q", out[len(out)-60:])
 	}
 	// utf8.ValidString catches a split multi-byte rune.
 	if !utf8.ValidString(out) {
 		t.Fatalf("FormatOutput produced invalid UTF-8 after truncation (split rune)")
+	}
+}
+
+// Regression: a single-line body (no internal newline) that exceeds the cap must
+// NOT collapse to "<skill ...>\n" + the truncation note — that erases every
+// instruction byte. Body content must survive between the opening tag and the
+// note, and the closing </skill> frame must still be emitted so the document
+// stays well-formed (the package doc promises closing tags stay intact).
+func TestFormatOutputTruncatesSingleLineBodyKeepsFrame(t *testing.T) {
+	dir := t.TempDir()
+	// One long line of ASCII with no '\n', well past the 100KB cap.
+	body := strings.Repeat("A", maxSkillOutputSize*2)
+	writeSkill(t, dir, "big", "---\nname: big\n---\n"+body)
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(loaded))
+	}
+	out := FormatOutput(loaded[0])
+
+	// The closing frame must survive.
+	if !strings.HasSuffix(out, "\n</skill>") {
+		t.Fatalf("closing </skill> frame lost; tail=%q", out[len(out)-60:])
+	}
+	// The truncation note must be present.
+	if !strings.Contains(out, "(output truncated)") {
+		t.Fatalf("truncation note missing in output:\n...%s", out[len(out)-80:])
+	}
+	// At least one body byte must survive between the opening tag and the note;
+	// the whole output must not be "<skill ...>\n" + note.
+	openTagEnd := strings.Index(out, ">\n") + 2 // end of "<skill ...>\n"
+	noteIdx := strings.Index(out, "\n(output truncated)")
+	if noteIdx <= openTagEnd {
+		t.Fatalf("body erased: output is just opening tag + note = %q", out)
+	}
+	// Total stays under the cap.
+	if len(out) > maxSkillOutputSize {
+		t.Fatalf("output exceeds cap: %d > %d", len(out), maxSkillOutputSize)
+	}
+	if !utf8.ValidString(out) {
+		t.Fatalf("FormatOutput produced invalid UTF-8 after truncation")
 	}
 }
 
