@@ -467,11 +467,13 @@ func TestLoadAssetsVisitedEntriesBudget(t *testing.T) {
 // including the assets-overflow branch where the body is near the cap and the
 // truncation note would otherwise push it over.
 func TestFormatOutputAssetsOverflowStaysUnderHardLimit(t *testing.T) {
-	// Content lands under maxSkillOutputSize so len(body) < cap (body-overflow
-	// branch is skipped). Assets push the total over the cap, forcing the
-	// assets-overflow branch. body + truncationNote ≤ cap so the note can be
-	// appended without truncating body.
-	bodyContent := strings.Repeat("A", maxSkillOutputSize-80)
+	// The framed body lands just under maxSkillOutputSize, so the body-overflow
+	// branch is skipped. Assets push the total over the cap, forcing the
+	// assets-overflow branch. Adding the truncation note would exceed the cap,
+	// so appendTruncationNote must make room while preserving valid UTF-8.
+	openTag := fmt.Sprintf("<skill name=%q dir=%q>\n", "s", "/d")
+	closeTag := "\n</skill>"
+	bodyContent := strings.Repeat("A", maxSkillOutputSize-len(openTag)-len(closeTag)-1)
 	skill := Skill{
 		Name:    "s",
 		Dir:     "/d",
@@ -492,11 +494,6 @@ func TestFormatOutputAssetsOverflowStaysUnderHardLimit(t *testing.T) {
 	}
 	if !utf8.ValidString(out) {
 		t.Fatalf("invalid UTF-8 after truncation")
-	}
-	// The body content must be preserved intact (no truncation of body itself)
-	// since len(body) + len(note) ≤ cap.
-	if !strings.Contains(out, "AAAA") {
-		t.Fatalf("body content lost on assets-overflow path")
 	}
 	// Assets block must be dropped entirely — no <skill_assets> fragment.
 	if strings.Contains(out, "<skill_assets") {
@@ -721,7 +718,7 @@ func TestFormatOutputTruncationOmitsAssetsBlock(t *testing.T) {
 	// macOS filename limit is 255 bytes, so we use deep subdirectory nesting
 	// to build long relative names.
 	extras := make(map[string]string, maxAssetCount+100)
-	deepDir := strings.Repeat("abcdefghij/", 25) // 250+ chars of subdirectory
+	deepDir := strings.Repeat("d/", 90) // long relative path using short components
 	for i := 0; i < maxAssetCount+100; i++ {
 		extras[deepDir+fmt.Sprintf("asset-%04d.txt", i)] = "d"
 	}
@@ -796,7 +793,7 @@ func TestFormatOutputTruncationPriority(t *testing.T) {
 		// Small body, enough assets with long relative paths to exceed the cap
 		// when rendered at the discovery cap (maxAssetCount).
 		extras := make(map[string]string, maxAssetCount+100)
-		deepDir := strings.Repeat("abcdefghij/", 25)
+		deepDir := strings.Repeat("d/", 90)
 		for i := 0; i < maxAssetCount+100; i++ {
 			extras[deepDir+fmt.Sprintf("asset-%04d.txt", i)] = "d"
 		}
