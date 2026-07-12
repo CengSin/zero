@@ -9,15 +9,6 @@ import (
 	"path/filepath"
 )
 
-// noFollowOpenDir opens the directory named by path. On non-unix targets there
-// is no portable openat + O_NOFOLLOW primitive, so the traversal falls back to
-// pathname-based os.ReadDir (see CopyTree/hashTreeInto in fscopy.go). This
-// helper exists so the cross-platform CopyTree/HashTree entry points can share
-// a single shape; on non-unix it simply opens the dir for reading via os.Open.
-func noFollowOpenDir(path string) (*os.File, error) {
-	return os.Open(path)
-}
-
 // copyTreeAt is the non-unix fallback: pathname-based recursive copy. There is
 // no portable openat primitive on these targets, so the TOCTOU-narrowing that
 // the unix fd-held traversal provides is not available here; the traversal
