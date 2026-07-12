@@ -44,6 +44,23 @@ type Asset struct {
 // malicious skill from including huge binaries.
 const maxAssetSize = 1 << 20 // 1 MB
 
+// maxAssetCount caps the number of assets discovered by loadAssets. A skill
+// directory with thousands of tiny files would otherwise be traversed fully
+// (expensive I/O + sort) only to have the <skill_assets> block dropped by
+// FormatOutput when it exceeds maxSkillOutputSize. This cap bounds the
+// discovery cost regardless of the output cap. It is the real bound on
+// discovery; there is no depth cap that hides installed files because
+// fscopy.CopyTree installs files at any depth and the loader must keep every
+// installed file discoverable.
+const maxAssetCount = 500
+
+// maxTraversalDepth is a high safety bound on recursion depth, used only to
+// guard against a pathological cycle. It is deliberately larger than any
+// realistic skill tree (filesystems cap depth via PATH_MAX long before this),
+// so it never hides a legitimately installed file. Discovery is bounded in
+// practice by maxAssetCount, not by this depth.
+const maxTraversalDepth = 64
+
 // maxSkillOutputSize caps the total output of FormatOutput so a skill with many
 // large assets cannot blow out the model's context window.
 const maxSkillOutputSize = 100 << 10 // 100 KB
@@ -53,6 +70,8 @@ const maxSkillOutputSize = 100 << 10 // 100 KB
 // in the skill directory (omitted when there are none). Output is capped at
 // maxSkillOutputSize bytes; on overflow the body is kept complete and assets
 // are dropped, truncating the body itself only when it alone exceeds the cap.
+//
+// All code paths guarantee the returned string is at most maxSkillOutputSize bytes.
 func FormatOutput(skill Skill) string {
 	const truncationNote = "\n(output truncated)"
 
@@ -70,26 +89,31 @@ func FormatOutput(skill Skill) string {
 		const closeTag = "\n</skill>"
 		ceiling := maxSkillOutputSize - len(truncationNote) - len(closeTag)
 		contentStart := len(openTag)
+		dropFrame := false
 		if ceiling < contentStart {
-			ceiling = contentStart
-		}
-		cut := ceiling
-		if cut > len(body) {
-			cut = len(body)
-		}
-		for cut > contentStart && !utf8.RuneStart(body[cut]) {
-			cut--
-		}
-		if cut > contentStart {
-			if nl := strings.LastIndexByte(body[contentStart:cut], '\n'); nl >= 0 {
-				cut = contentStart + nl + 1
+			// openTag itself exceeds the budget after reserving note+closeTag.
+			// Drop both note and closeTag to keep as much content as possible.
+			ceiling = maxSkillOutputSize
+			// If even the open tag alone exceeds the hard limit, there is no
+			// room to preserve it whole — truncate the open tag itself (and any
+			// following content) to the hard limit. The result is a partial
+			// frame, but it never exceeds maxSkillOutputSize.
+			if contentStart > maxSkillOutputSize {
+				contentStart = maxSkillOutputSize
+				dropFrame = true
 			}
 		}
-		if cut < contentStart {
-			cut = contentStart
+		cut := snapToLine(body, contentStart, min(ceiling, len(body)))
+		// dropFrame is set only when the open tag alone overflowed: emit the
+		// truncated-open-tag prefix with no note/closeTag.
+		if dropFrame {
+			return body[:cut]
 		}
-		if cut > len(body) {
-			cut = len(body)
+		// When ceiling was raised to maxSkillOutputSize (openTag too long for
+		// note+closeTag but still within the hard limit), emit just the
+		// truncated body without note/closeTag.
+		if ceiling == maxSkillOutputSize {
+			return body[:cut]
 		}
 		return body[:cut] + truncationNote + closeTag
 	}
@@ -97,13 +121,75 @@ func FormatOutput(skill Skill) string {
 	if len(skill.Assets) == 0 {
 		return body
 	}
+	// Cheap pre-check: if the body alone already leaves no room for even the
+	// <skill_assets> open tag, the rendered block can never fit — skip the
+	// render entirely (it would build a ~140KB string only to be discarded).
+	// Keep the complete body and append the truncation note (subject to the
+	// same hard-limit guard as the post-render overflow branch below).
+	if len(body)+len(assetBlockOpen(skill.Name))+len(assetBlockClose) > maxSkillOutputSize {
+		return appendTruncationNote(body)
+	}
 	assets := renderAssets(skill)
 	if len(body)+len(assets) > maxSkillOutputSize {
 		// Keep the complete body, drop the assets block, and note the truncation.
-		return body + truncationNote
+		return appendTruncationNote(body)
 	}
 	return body + assets
 }
+
+// appendTruncationNote returns body with the truncation note appended, never
+// exceeding maxSkillOutputSize. When body alone is so close to the limit that
+// the note would not fit, body is truncated (on a rune + line boundary) to
+// make room for the note. The result is always <= maxSkillOutputSize bytes.
+func appendTruncationNote(body string) string {
+	const truncationNote = "\n(output truncated)"
+	if len(body)+len(truncationNote) <= maxSkillOutputSize {
+		return body + truncationNote
+	}
+	cut := snapToLine(body, 0, maxSkillOutputSize-len(truncationNote))
+	return body[:cut] + truncationNote
+}
+
+// snapToLine snaps a cut index down to a UTF-8 rune boundary and then back to
+// the preceding newline, so a truncation never splits a multi-byte rune or a
+// line. floor is the minimum cut (e.g. the end of an open tag that must be
+// preserved); ceiling is the maximum cut. The returned cut is in [floor,
+// len(body)] and never exceeds ceiling. Both FormatOutput's body-overflow
+// branch and appendTruncationNote share this so the two truncation sites cannot
+// drift.
+func snapToLine(body string, floor, ceiling int) int {
+	if floor < 0 {
+		floor = 0
+	}
+	cut := ceiling
+	if cut > len(body) {
+		cut = len(body)
+	}
+	for cut > floor && !utf8.RuneStart(body[cut]) {
+		cut--
+	}
+	if cut > floor {
+		if nl := strings.LastIndexByte(body[floor:cut], '\n'); nl >= 0 {
+			cut = floor + nl + 1
+		}
+	}
+	if cut < floor {
+		cut = floor
+	}
+	if cut > len(body) {
+		cut = len(body)
+	}
+	return cut
+}
+
+// assetBlockOpen is the opening tag of the <skill_assets> block; pre-computed
+// here so the pre-check in FormatOutput can estimate the minimum overhead of
+// rendering assets without actually rendering them.
+func assetBlockOpen(name string) string {
+	return "\n\n" + fmt.Sprintf("<skill_assets name=%q>\n", name)
+}
+
+const assetBlockClose = "</skill_assets>"
 
 // renderAssets builds the <skill_assets> block for a skill, rendering asset
 // paths relative to the skill directory.
@@ -239,9 +325,10 @@ func confineSkillPath(rootReal string, manifestPath string) (string, os.FileInfo
 // confineSkillPath so symlinked assets pointing outside the root are silently
 // skipped. Name is the path relative to the skill directory (so the model never
 // sees the user's home directory); Path is the same relative path, kept absolute
-// relative to skillDir for callers that need to open the file. Recursion matches
-// fscopy.CopyTree's install depth, so every file that lands on disk is
-// discoverable (issue #584 — "contents of subdirectories").
+// relative to skillDir for callers that need to open the file. Discovery
+// recurses without an artificial depth cap so every file fscopy.CopyTree
+// installs (at any depth) stays discoverable (issue #584 — "contents of
+// subdirectories"); the traversal is bounded by maxAssetCount instead.
 func loadAssets(rootReal string, skillDir string) []Asset {
 	// Resolve the skill dir through symlinks so the relative paths computed
 	// below share a base with the EvalSymlinks-resolved real paths returned by
@@ -252,7 +339,7 @@ func loadAssets(rootReal string, skillDir string) []Asset {
 		relBase = resolved
 	}
 	var assets []Asset
-	appendAssetsRecursive(rootReal, relBase, relBase, &assets)
+	appendAssetsRecursive(rootReal, relBase, relBase, &assets, 0)
 	// Deterministic order: sort by the skill-relative name so the <skill_assets>
 	// list is stable across loads regardless of readdir ordering.
 	sort.Slice(assets, func(i, j int) bool { return assets[i].Name < assets[j].Name })
@@ -261,13 +348,32 @@ func loadAssets(rootReal string, skillDir string) []Asset {
 
 // appendAssetsRecursive walks dir, appending a regular-file Asset for each
 // eligible entry. relBase is the skill directory (the root relative paths are
-// computed against); dir is the current directory being walked.
-func appendAssetsRecursive(rootReal, relBase, dir string, assets *[]Asset) {
+// computed against); dir is the current directory being walked; depth is the
+// current recursion depth (0 = skill root), used only to guard against a
+// pathological cycle. Discovery is bounded by maxAssetCount, not by depth, so
+// every file fscopy.CopyTree installs (at any depth) stays discoverable.
+func appendAssetsRecursive(rootReal, relBase, dir string, assets *[]Asset, depth int) {
+	// Stop recursing if we've hit the asset count cap — further entries would
+	// be discarded anyway, so skip the I/O.
+	if len(*assets) >= maxAssetCount {
+		return
+	}
+	// Defense against a pathological cycle (a directory that somehow links
+	// back into an ancestor). Real filesystems don't cycle, and entry.IsDir()
+	// is false for symlinks, so this only fires for a genuinely broken tree;
+	// it never hides a legitimately installed file.
+	if depth > maxTraversalDepth {
+		return
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, entry := range entries {
+		// Re-check on each iteration so a large directory stops early.
+		if len(*assets) >= maxAssetCount {
+			return
+		}
 		name := entry.Name()
 		// Skip hidden files/dirs (.git, .env, .DS_Store, etc.) at every level.
 		if strings.HasPrefix(name, ".") {
@@ -278,7 +384,7 @@ func appendAssetsRecursive(rootReal, relBase, dir string, assets *[]Asset) {
 			// Recurse into real subdirectories. A symlink-to-dir is NOT a dir
 			// (entry.IsDir() is false for symlinks), so it falls through to
 			// confineSkillPath, which rejects it via EvalSymlinks + IsRegular.
-			appendAssetsRecursive(rootReal, relBase, candidate, assets)
+			appendAssetsRecursive(rootReal, relBase, candidate, assets, depth+1)
 			continue
 		}
 		// Skip SKILL.md (already loaded as Content). Case-insensitive so a

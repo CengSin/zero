@@ -368,6 +368,121 @@ func TestLoadDiscoversAssetsRecursively(t *testing.T) {
 	}
 }
 
+// Regression: assets nested deeper than any reasonable fixed depth cap must
+// still be discovered, because fscopy.CopyTree installs files at ANY depth and
+// the loader must keep every installed file discoverable. A depth cap that
+// hides installed assets would make a skill silently appear asset-free while
+// files the skill references exist on disk. This nests an asset 25 levels deep
+// (well past the old maxAssetDepth=8) and confirms it is listed.
+func TestLoadDiscoversDeeplyNestedAssets(t *testing.T) {
+	dir := t.TempDir()
+	// 25 levels of subdirectories — exceeds any shallow fixed cap, stays well
+	// under maxTraversalDepth and the filesystem PATH_MAX.
+	deep := strings.Repeat("d/", 25) + "leaf.sh"
+	writeSkillWithAssets(t, dir, "nested",
+		"---\nname: nested\n---\nbody",
+		map[string]string{deep: "#!/bin/sh\necho deep\n"},
+	)
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(loaded))
+	}
+	found := false
+	for _, a := range loaded[0].Assets {
+		if strings.HasSuffix(filepath.ToSlash(a.Name), "leaf.sh") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("deeply nested asset (25 levels) not discovered; Assets=%v", loaded[0].Assets)
+	}
+}
+
+// maxAssetCount bounds discovery: a skill with more than maxAssetCount eligible
+// files must stop discovering after the cap rather than traversing the whole
+// tree, so a huge directory cannot stall skill load.
+func TestLoadAssetsCountCapStopsDiscovery(t *testing.T) {
+	dir := t.TempDir()
+	extras := make(map[string]string, maxAssetCount+50)
+	for i := 0; i < maxAssetCount+50; i++ {
+		extras[fmt.Sprintf("asset-%04d.txt", i)] = "d"
+	}
+	writeSkillWithAssets(t, dir, "many", "---\nname: many\n---\nbody", extras)
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded[0].Assets) > maxAssetCount {
+		t.Fatalf("discovery exceeded cap: got %d assets, cap %d", len(loaded[0].Assets), maxAssetCount)
+	}
+}
+
+// FormatOutput must never exceed maxSkillOutputSize on any overflow path,
+// including the assets-overflow branch where the body is near the cap and the
+// truncation note would otherwise push it over.
+func TestFormatOutputAssetsOverflowStaysUnderHardLimit(t *testing.T) {
+	// Body lands just under maxSkillOutputSize so len(body)+note would exceed
+	// the cap. Assets push the total further over, forcing the assets-overflow
+	// branch into its "make room for the note" sub-path.
+	body := strings.Repeat("A", maxSkillOutputSize-10)
+	skill := Skill{
+		Name:    "s",
+		Dir:     "/d",
+		Content: body,
+		Assets:  []Asset{{Name: "a.txt", Path: "/d/a.txt", Size: 1}},
+	}
+	out := FormatOutput(skill)
+	if len(out) > maxSkillOutputSize {
+		t.Fatalf("assets-overflow output exceeds cap: %d > %d", len(out), maxSkillOutputSize)
+	}
+	if !strings.Contains(out, "(output truncated)") {
+		t.Fatalf("truncation note missing: %q", out[len(out)-60:])
+	}
+	if !utf8.ValidString(out) {
+		t.Fatalf("invalid UTF-8 after truncation")
+	}
+}
+
+// FormatOutput must stay under the hard limit even when the open tag is so
+// large that reserving note+closeTag leaves no room for content.
+func TestFormatOutputHugeOpenTagStaysUnderHardLimit(t *testing.T) {
+	// A name so long the open tag alone approaches the cap.
+	huge := strings.Repeat("n", maxSkillOutputSize-5)
+	skill := Skill{
+		Name:    huge,
+		Dir:     "/d",
+		Content: strings.Repeat("B", maxSkillOutputSize*2),
+	}
+	out := FormatOutput(skill)
+	if len(out) > maxSkillOutputSize {
+		t.Fatalf("huge-openTag output exceeds cap: %d > %d", len(out), maxSkillOutputSize)
+	}
+	if !utf8.ValidString(out) {
+		t.Fatalf("invalid UTF-8 after truncation")
+	}
+}
+
+// FormatOutput must stay under the hard limit even when the open tag ALONE
+// exceeds the cap (name + dir longer than maxSkillOutputSize). The frame is
+// truncated mid-tag; no note or close tag is appended.
+func TestFormatOutputOpenTagExceedsCapAlone(t *testing.T) {
+	skill := Skill{
+		Name:    strings.Repeat("n", maxSkillOutputSize+200),
+		Dir:     "/" + strings.Repeat("d", maxSkillOutputSize),
+		Content: "body",
+	}
+	out := FormatOutput(skill)
+	if len(out) > maxSkillOutputSize {
+		t.Fatalf("openTag-exceeds-cap output exceeds cap: %d > %d", len(out), maxSkillOutputSize)
+	}
+	if !utf8.ValidString(out) {
+		t.Fatalf("invalid UTF-8 after truncation")
+	}
+}
+
 // #2/#5: hidden files and subdirectories are skipped at every level (.git,
 // .env, .DS_Store), so a .git inside a subdirectory does not leak assets.
 func TestLoadSkipsHiddenFilesAndDirsAtEveryLevel(t *testing.T) {
@@ -512,12 +627,15 @@ func TestFormatOutputTruncatesSingleLineBodyKeepsFrame(t *testing.T) {
 // result carries exactly one </skill> and no partial asset fragment.
 func TestFormatOutputTruncationOmitsAssetsBlock(t *testing.T) {
 	dir := t.TempDir()
-	// Many asset files whose listing lines push the total well over the cap,
-	// while the body itself is tiny. Each file stays under maxAssetSize.
-	extras := make(map[string]string, 1200)
-	longName := strings.Repeat("x", 80) // long per-line asset name
-	for i := 0; i < 1200; i++ {
-		extras[fmt.Sprintf("asset-%04d-x", i)+longName] = "d"
+	// Enough asset files with long relative paths (via nested subdirectories)
+	// so the rendered listing at the discovery cap exceeds maxSkillOutputSize.
+	// Each line ≈ 280 bytes × 500 assets ≈ 140KB > 100KB cap.
+	// macOS filename limit is 255 bytes, so we use deep subdirectory nesting
+	// to build long relative names.
+	extras := make(map[string]string, maxAssetCount+100)
+	deepDir := strings.Repeat("abcdefghij/", 25) // 250+ chars of subdirectory
+	for i := 0; i < maxAssetCount+100; i++ {
+		extras[deepDir+fmt.Sprintf("asset-%04d.txt", i)] = "d"
 	}
 	writeSkillWithAssets(t, dir, "big", "---\nname: big\n---\nsmall body\n", extras)
 
@@ -587,10 +705,12 @@ func TestFormatOutputTruncationPriority(t *testing.T) {
 
 	t.Run("body_fits_assets_overflow_assets_dropped_body_intact", func(t *testing.T) {
 		dir := t.TempDir()
-		// Small body, enough assets to exceed the cap when appended.
-		extras := make(map[string]string, 2000)
-		for i := 0; i < 2000; i++ {
-			extras[fmt.Sprintf("asset-%04d-%s", i, strings.Repeat("x", 80))] = "d"
+		// Small body, enough assets with long relative paths to exceed the cap
+		// when rendered at the discovery cap (maxAssetCount).
+		extras := make(map[string]string, maxAssetCount+100)
+		deepDir := strings.Repeat("abcdefghij/", 25)
+		for i := 0; i < maxAssetCount+100; i++ {
+			extras[deepDir+fmt.Sprintf("asset-%04d.txt", i)] = "d"
 		}
 		writeSkillWithAssets(t, dir, "s", "---\nname: s\n---\nUNIQUE_BODY_MARKER", extras)
 		loaded, err := Load(dir)

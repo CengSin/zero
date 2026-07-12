@@ -109,20 +109,65 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 		return InstallResult{}, err
 	}
 
-	// Validate by parsing the SKILL.md through the same loader the runtime uses;
-	// reject anything without a usable frontmatter/dir name.
+	// Quick sanity check: reject a symlinked SKILL.md in the source early, so
+	// the error message names the problem rather than failing deep inside
+	// CopyTree (which silently skips symlinks, staging without a manifest).
 	manifestPath := filepath.Join(skillDir, skillFileName)
-	data, err := os.ReadFile(manifestPath)
-	if err != nil {
+	if info, err := os.Lstat(manifestPath); err != nil {
 		return InstallResult{}, fmt.Errorf("read SKILL.md: %w", err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		return InstallResult{}, fmt.Errorf("SKILL.md is a symlink (refusing to install)")
 	}
-	parsed := parseSkill(filepath.Base(skillDir), manifestPath, string(data))
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return InstallResult{}, fmt.Errorf("create skills dir: %w", err)
+	}
+	// Stage the new tree into a temp dir on the SAME filesystem as dir (its
+	// parent directory) so the swap into place is a single atomic rename. We
+	// copy FIRST and only clear the previous install AFTER the copy succeeds,
+	// so a failed copy (full disk, permission denied) leaves the previously
+	// installed skill and its lockfile entry completely intact instead of
+	// wiping them and stranding the lockfile pointing at a deleted directory.
+	staging, err := os.MkdirTemp(dir, ".zero-skill-install-")
+	if err != nil {
+		return InstallResult{}, fmt.Errorf("create staging dir: %w", err)
+	}
+	// A single deferred cleanup collapses the otherwise-repeated RemoveAll on
+	// every error path below. committed is set to true only once the staging
+	// tree has been renamed into place by swapDirIntoPlace, at which point the
+	// staging path no longer exists and the deferred RemoveAll is a no-op. The
+	// post-swap lock-failure path must NOT remove `target` (the installed skill)
+	// — the defer only ever touches `staging`, so that invariant is preserved.
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.RemoveAll(staging)
+		}
+	}()
+	// Copy the full skill tree (SKILL.md, scripts, assets, subdirectories).
+	// Copy DATA only — never execute anything.
+	if err := fscopy.CopyTree(skillDir, staging); err != nil {
+		return InstallResult{}, fmt.Errorf("copy skill: %w", err)
+	}
+
+	// Validate the manifest from the STAGING copy — not from the source — so
+	// the validated object is the same tree that will be installed. This
+	// eliminates the gap where a source-tree mutation between validation and
+	// copy could install something different from what was validated.
+	stagingManifest := filepath.Join(staging, skillFileName)
+	data, err := os.ReadFile(stagingManifest)
+	if err != nil {
+		return InstallResult{}, fmt.Errorf("staged SKILL.md missing (source may contain only symlinks): %w", err)
+	}
+	parsed := parseSkill(filepath.Base(skillDir), stagingManifest, string(data))
 	name := strings.TrimSpace(parsed.Name)
 	if name == "" || !validSkillName(name) {
 		return InstallResult{}, fmt.Errorf("skill has no usable name (set a frontmatter `name:` or use a directory name of letters, numbers, dots, dashes, or underscores)")
 	}
 
-	hash, err := fscopy.HashTree(skillDir)
+	// Hash the staging tree — the actual installed content — not the source.
+	// This ensures the recorded hash matches what is on disk after the swap.
+	hash, err := fscopy.HashTree(staging)
 	if err != nil {
 		return InstallResult{}, fmt.Errorf("hash skill: %w", err)
 	}
@@ -138,31 +183,14 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 	}
 
 	target := filepath.Join(dir, name)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return InstallResult{}, fmt.Errorf("create skills dir: %w", err)
-	}
-	// Stage the new tree into a temp dir on the SAME filesystem as dir (its
-	// parent directory) so the swap into place is a single atomic rename. We
-	// copy FIRST and only clear the previous install AFTER the copy succeeds,
-	// so a failed copy (full disk, permission denied) leaves the previously
-	// installed skill and its lockfile entry completely intact instead of
-	// wiping them and stranding the lockfile pointing at a deleted directory.
-	staging, err := os.MkdirTemp(dir, ".zero-skill-install-")
-	if err != nil {
-		return InstallResult{}, fmt.Errorf("create staging dir: %w", err)
-	}
-	// Copy the full skill tree (SKILL.md, scripts, assets, subdirectories).
-	// Copy DATA only — never execute anything.
-	if err := fscopy.CopyTree(skillDir, staging); err != nil {
-		_ = os.RemoveAll(staging)
-		return InstallResult{}, fmt.Errorf("copy skill: %w", err)
-	}
 	if err := swapDirIntoPlace(staging, target); err != nil {
-		_ = os.RemoveAll(staging)
 		return InstallResult{}, err
 	}
-	// staging was renamed into place (path no longer exists); RemoveAll is a no-op.
-	_ = os.RemoveAll(staging)
+	// staging has been renamed into place (path no longer exists); mark
+	// committed so the deferred RemoveAll skips it. The deferred no-op remains
+	// safe even if a later step (writeLock) fails — `target`, not `staging`,
+	// is the installed skill and is never touched by the defer.
+	committed = true
 
 	lock[name] = LockEntry{Source: source, Hash: hash}
 	if err := writeLock(dir, lock); err != nil {

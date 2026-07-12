@@ -43,6 +43,12 @@ func CopyTree(src string, dst string) error {
 			// turn a copy into a write/read primitive elsewhere.
 			continue
 		case info.IsDir():
+			// TOCTOU guard: verify the directory was not replaced with a symlink
+			// between the Lstat above and the recursive ReadDir inside CopyTree.
+			dev, ino := dirIdentity(srcPath, info)
+			if err := verifyDirNofollow(srcPath, dev, ino); err != nil {
+				return err
+			}
 			if err := CopyTree(srcPath, dstPath); err != nil {
 				return err
 			}
@@ -147,6 +153,12 @@ func hashTreeInto(hasher io.Writer, root string, dir string) error {
 			// entry is self-delimiting.
 			header := fmt.Sprintf("%s\x00dir\x000\x00", filepath.ToSlash(rel))
 			if _, err := io.WriteString(hasher, header); err != nil {
+				return err
+			}
+			// TOCTOU guard: verify the directory was not replaced with a symlink
+			// between the Lstat above and the recursive ReadDir inside hashTreeInto.
+			dev, ino := dirIdentity(path, info)
+			if err := verifyDirNofollow(path, dev, ino); err != nil {
 				return err
 			}
 			if err := hashTreeInto(hasher, root, path); err != nil {
