@@ -140,15 +140,17 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return InstallResult{}, fmt.Errorf("create plugins dir: %w", err)
 	}
-	// Stage the new tree into a temp dir on the SAME filesystem as dir (its
-	// parent directory) so the swap into place is a single atomic rename. We
-	// copy FIRST and only clear the previous install AFTER the copy succeeds,
-	// so a failed copy (full disk, permission denied) leaves the previously
-	// installed plugin and its lockfile entry completely intact instead of
-	// wiping them and stranding the lockfile pointing at a deleted directory.
+	// Stage the new tree outside the scanned plugins root, but still on the SAME
+	// filesystem (the root's parent directory), so the swap into place is a
+	// single atomic rename and concurrent loaders cannot discover a partial
+	// tree. We copy FIRST and only clear the previous install AFTER the copy
+	// succeeds, so a failed copy (full disk, permission denied) leaves the
+	// previously installed plugin and its lockfile entry completely intact
+	// instead of wiping them and stranding the lockfile pointing at a deleted
+	// directory.
 	// Copy the whole plugin tree (entry scripts, prompts, skills) so the installed
 	// plugin is runnable through activation. Copy DATA only — never execute it.
-	if err := copyAndSwapIntoPlace(pluginDir, dir, target); err != nil {
+	if err := copyAndSwapIntoPlace(pluginDir, filepath.Dir(filepath.Clean(dir)), target); err != nil {
 		return InstallResult{}, err
 	}
 
@@ -173,12 +175,12 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 }
 
 // copyAndSwapIntoPlace copies src into a temp staging dir on the same filesystem
-// as target (its parent, dirParent), then atomically swaps the staging dir into
-// place at target. The copy happens before the previous install is touched, so a
-// copy failure leaves the existing target (if any) intact. On success the old
-// install (if any) is removed; on a swap failure it is rolled back into place, so
-// an install never ends with the plugin gone but the lockfile still pointing at
-// it.
+// as target (typically outside the scanned plugin root), then atomically swaps
+// the staging dir into place at target. The copy happens before the previous
+// install is touched, so a copy failure leaves the existing target (if any)
+// intact. On success the old install (if any) is removed; on a swap failure
+// it is rolled back into place, so an install never ends with the plugin gone
+// but the lockfile still pointing at it.
 func copyAndSwapIntoPlace(src, dirParent, target string) error {
 	staging, err := os.MkdirTemp(dirParent, ".zero-plugin-install-")
 	if err != nil {
