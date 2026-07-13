@@ -396,9 +396,14 @@ func appendAssetsRecursive(rootReal, relBase, dir string, assets *[]Asset, visit
 			appendAssetsRecursive(rootReal, relBase, candidate, assets, visited)
 			continue
 		}
-		// Skip SKILL.md (already loaded as Content). Case-insensitive so a
-		// case-insensitive filesystem (macOS/Windows) can't surface it twice.
-		if strings.EqualFold(name, skillFileName) {
+		// Skip the root manifest SKILL.md (already loaded as Content). Only the
+		// top-level manifest is excluded: a nested file named SKILL.md — a copied
+		// asset such as templates/SKILL.md or an embedded sub-skill manifest — is
+		// not the loaded manifest, so it must stay in Skill.Assets. Comparing the
+		// current directory to relBase restricts the skip to the skill root; the
+		// case-insensitive match still guards against a case-insensitive
+		// filesystem (macOS/Windows) surfacing the manifest twice.
+		if dir == relBase && strings.EqualFold(name, skillFileName) {
 			continue
 		}
 		realPath, info, ok := confineSkillPath(rootReal, candidate)

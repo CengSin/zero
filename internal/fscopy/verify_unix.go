@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"golang.org/x/sys/unix"
 )
@@ -77,7 +78,7 @@ func readDirAt(dir *os.File) ([]dirEntryInfo, error) {
 		return nil, &os.PathError{Op: "readdir", Path: dir.Name(), Err: err}
 	}
 	// Readdirnames does not guarantee sort order; sort for stable traversal.
-	sortStrings(names)
+	sort.Strings(names)
 	out := make([]dirEntryInfo, 0, len(names))
 	dirFd := int(dir.Fd())
 	for _, name := range names {
@@ -144,20 +145,6 @@ func openRegularReadAt(parent *os.File, name string) (*os.File, error) {
 		return nil, &os.PathError{Op: "setnonblock", Path: filepath.Join(parent.Name(), name), Err: err}
 	}
 	return os.NewFile(uintptr(fd), filepath.Join(parent.Name(), name)), nil
-}
-
-// sortStrings sorts a slice of strings in place. Kept local so the fd-based
-// traversal does not depend on the sort import in the cross-platform file.
-func sortStrings(s []string) {
-	// Insertion sort is fine — directory entry counts are small and this avoids
-	// pulling sort into every build of the package. For very large dirs the
-	// stdlib sort.Slice would be faster, but the entry list is bounded in
-	// practice by the filesystem directory size.
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j-1] > s[j]; j-- {
-			s[j-1], s[j] = s[j], s[j-1]
-		}
-	}
 }
 
 // copyTreeAt is the fd-held core of CopyTree on unix. parent is the already-open

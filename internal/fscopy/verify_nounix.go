@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // copyTreeAt is the non-unix fallback: pathname-based recursive copy. There is
@@ -79,7 +80,7 @@ func hashTreeIntoPath(hasher io.Writer, root, dir string) error {
 	for _, entry := range entries {
 		names = append(names, entry.Name())
 	}
-	sortStrings(names)
+	sort.Strings(names)
 	for _, name := range names {
 		if name == ".git" {
 			continue
@@ -145,14 +146,4 @@ func hashTreeIntoPath(hasher io.Writer, root, dir string) error {
 		}
 	}
 	return nil
-}
-
-// sortStrings sorts a slice of strings in place (insertion sort — directory
-// entry counts are small).
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j-1] > s[j]; j-- {
-			s[j-1], s[j] = s[j], s[j-1]
-		}
-	}
 }

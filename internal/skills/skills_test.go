@@ -416,6 +416,57 @@ func TestLoadDiscoversDeeplyNestedAssets(t *testing.T) {
 	}
 }
 
+// Regression: a file named SKILL.md nested below the skill root is NOT the
+// loaded manifest (the root SKILL.md is), so it must remain in Skill.Assets as
+// an ordinary asset. Examples: templates/SKILL.md (a copied template the skill
+// references) or subskill/SKILL.md (an embedded sub-skill manifest). The loader
+// previously skipped every recursively encountered SKILL.md by basename, which
+// silently dropped these from model-facing output. Only the root manifest is
+// excluded now.
+func TestLoadKeepsNestedSkillMdAsAsset(t *testing.T) {
+	dir := t.TempDir()
+	writeSkillWithAssets(t, dir, "tmpl",
+		"---\nname: tmpl\ndescription: d\n---\nbody",
+		map[string]string{
+			"templates/SKILL.md": "# template manifest\n",
+			"subskill/SKILL.md":  "---\nname: sub\n---\nsub body\n",
+			"README.md":          "docs\n",
+		},
+	)
+
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded) != 1 || loaded[0].Name != "tmpl" {
+		t.Fatalf("expected tmpl skill, got %+v", loaded)
+	}
+	skill := loaded[0]
+	gotNames := map[string]bool{}
+	for _, a := range skill.Assets {
+		gotNames[a.Name] = true
+	}
+	wantNames := []string{
+		"templates/SKILL.md",
+		"subskill/SKILL.md",
+		"README.md",
+	}
+	for _, want := range wantNames {
+		if !gotNames[want] {
+			t.Errorf("expected nested asset %q in Skill.Assets, got %v", want, skill.Assets)
+		}
+	}
+	// The root manifest must still be excluded — only nested SKILL.md survives.
+	for _, a := range skill.Assets {
+		if a.Name == "SKILL.md" {
+			t.Errorf("root SKILL.md must not appear in Assets")
+		}
+	}
+	if len(skill.Assets) != len(wantNames) {
+		t.Errorf("expected %d assets, got %d (%v)", len(wantNames), len(skill.Assets), skill.Assets)
+	}
+}
+
 // maxAssetCount bounds discovery: a skill with more than maxAssetCount eligible
 // files must stop discovering after the cap rather than traversing the whole
 // tree, so a huge directory cannot stall skill load.
