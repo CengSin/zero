@@ -122,13 +122,16 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return InstallResult{}, fmt.Errorf("create skills dir: %w", err)
 	}
-	// Stage the new tree into a temp dir on the SAME filesystem as dir (its
-	// parent directory) so the swap into place is a single atomic rename. We
-	// copy FIRST and only clear the previous install AFTER the copy succeeds,
-	// so a failed copy (full disk, permission denied) leaves the previously
-	// installed skill and its lockfile entry completely intact instead of
-	// wiping them and stranding the lockfile pointing at a deleted directory.
-	staging, err := os.MkdirTemp(dir, ".zero-skill-install-")
+	// Stage the new tree outside the scanned skills root, but still on the SAME
+	// filesystem (the root's parent directory), so the swap into place is a
+	// single atomic rename and concurrent loaders cannot discover a partial
+	// tree. We copy FIRST and only clear the previous install AFTER the copy
+	// succeeds, so a failed copy (full disk, permission denied) leaves the
+	// previously installed skill and its lockfile entry completely intact
+	// instead of wiping them and stranding the lockfile pointing at a deleted
+	// directory.
+	stagingParent := filepath.Dir(filepath.Clean(dir))
+	staging, err := os.MkdirTemp(stagingParent, ".zero-skill-install-")
 	if err != nil {
 		return InstallResult{}, fmt.Errorf("create staging dir: %w", err)
 	}
