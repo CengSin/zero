@@ -122,6 +122,14 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return InstallResult{}, fmt.Errorf("create skills dir: %w", err)
 	}
+	// Converge any interrupted replace from a prior install into this root before
+	// we create a new staging dir; otherwise a kill between the two renames of a
+	// previous swap would leave target absent with the old tree stranded under a
+	// deterministic backup name — this restores it and sweeps any orphaned
+	// staging before a new install can clash with either.
+	if err := RecoverPending(dir); err != nil {
+		return InstallResult{}, err
+	}
 	// Stage the new tree outside the scanned skills root, but still on the SAME
 	// filesystem (the root's parent directory), so the swap into place is a
 	// single atomic rename and concurrent loaders cannot discover a partial
@@ -213,18 +221,42 @@ func Install(ctx context.Context, options InstallOptions) (InstallResult, error)
 	return result, nil
 }
 
+// swapPrefix marks a staged-replacement backup directory. A swap moves the
+// existing target aside under a name derived from this prefix plus the skill
+// name; the deterministic suffix lets RecoverPending recognize a backup a
+// crashed swap left behind and either complete (commit) or undo (rollback) it.
+const swapPrefix = ".zero-skill-replace-"
+
+// stagingPrefix marks a transient staging directory created during install.
+const stagingPrefix = ".zero-skill-install-"
+
 // swapDirIntoPlace atomically replaces target with the already-complete staging
 // directory. staging must live on the same filesystem as target (Install creates
 // it in the target's parent). On success staging is consumed (renamed) and target
 // holds the new skill. On any failure target is left untouched and an error is
 // returned, so a half-copied install never destroys the previous one.
+//
+// The replace is a two-rename sequence (stash old → move new in → drop old), not
+// a single atomic syscall. To be recoverable across a kill or power loss between
+// those renames, the existing install is stashed under a DETERMINISTIC name
+// (swapPrefix + name) rather than staging+".old", and recoverSwap runs first to
+// converge any interrupted prior replace for this target. A crash after the stash
+// leaves target absent with the old tree stranded under a known name, and the next
+// recoverSwap (Install or Load) restores it.
 func swapDirIntoPlace(staging string, target string) error {
+	backup := filepath.Join(filepath.Dir(filepath.Clean(target)), swapPrefix+filepath.Base(target))
+	if err := recoverSwap(backup, target); err != nil {
+		_ = os.RemoveAll(staging)
+		return err
+	}
 	// No existing install: a plain rename is already atomic.
 	if _, err := os.Stat(target); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
+			_ = os.RemoveAll(staging)
 			return fmt.Errorf("stat target: %w", err)
 		}
 		if err := os.Rename(staging, target); err != nil {
+			_ = os.RemoveAll(staging)
 			return fmt.Errorf("install skill: %w", err)
 		}
 		return nil
@@ -233,16 +265,88 @@ func swapDirIntoPlace(staging string, target string) error {
 	// Existing install present: move it aside, swap the new tree in, then drop
 	// the old one — but only after the swap succeeds, so a failed rename rolls
 	// the previous install back into place and the failure stays non-destructive.
-	backup := staging + ".old"
 	if err := os.Rename(target, backup); err != nil {
+		_ = os.RemoveAll(staging)
 		return fmt.Errorf("stash previous skill: %w", err)
 	}
 	if err := os.Rename(staging, target); err != nil {
 		// Roll the previous install back so the failure leaves the old skill intact.
 		_ = os.Rename(backup, target)
+		_ = os.RemoveAll(staging)
 		return fmt.Errorf("install skill: %w", err)
 	}
-	_ = os.RemoveAll(backup)
+	return os.RemoveAll(backup)
+}
+
+// recoverSwap converges an interrupted replace of target to a known state. It
+// is idempotent — safe to run any number of times, and safe after a crash of
+// its own — because it branches purely on which of {backup, target} currently
+// exist:
+//
+//	backup absent                  → nothing to recover
+//	target present + backup present → crashed after the new tree landed; commit by dropping backup
+//	target absent  + backup present → crashed after stashing the old tree but before the new one landed; roll the old tree back to target
+//
+// backup must be the deterministic name swapDirIntoPlace uses.
+func recoverSwap(backup, target string) error {
+	if _, err := os.Stat(backup); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("stat swap backup: %w", err)
+	}
+	if _, err := os.Stat(target); err == nil {
+		// New tree already landed; the backup is the now-superseded old tree.
+		return os.RemoveAll(backup)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat target: %w", err)
+	}
+	// Target absent, backup present: the old tree was stashed but the new one
+	// never landed. Restore it so the canonical install (and the lockfile entry
+	// pointing at it) is whole again.
+	if err := os.Rename(backup, target); err != nil {
+		return fmt.Errorf("restore previous skill: %w", err)
+	}
+	return nil
+}
+
+// RecoverPending converges every interrupted skill replace under dir to a known
+// state, and sweeps orphaned staging dirs a crashed install left behind. It is
+// safe and no-op when nothing is pending. Call it before discovering the skills
+// root (Load) and at the start of any install into the same root, so a kill or
+// power loss between the two renames of a prior install never leaves the
+// canonical install absent with the old tree stranded under a random name and
+// the lockfile pointing at a missing target.
+func RecoverPending(dir string) error {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return nil
+	}
+	parent := filepath.Dir(filepath.Clean(dir))
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("scan install parent: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		switch {
+		case strings.HasPrefix(name, swapPrefix):
+			skillName := strings.TrimPrefix(name, swapPrefix)
+			if !validSkillName(skillName) {
+				continue
+			}
+			if err := recoverSwap(filepath.Join(parent, name), filepath.Join(dir, skillName)); err != nil {
+				return err
+			}
+		case strings.HasPrefix(name, stagingPrefix):
+			// Orphaned staging from a crashed install: no transaction to
+			// converge, just reclaim the space.
+			_ = os.RemoveAll(filepath.Join(parent, name))
+		}
+	}
 	return nil
 }
 

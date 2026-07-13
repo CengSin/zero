@@ -457,3 +457,180 @@ func TestInstallDoesNotWipePreviousOnCopyFailure(t *testing.T) {
 		}
 	}
 }
+
+// TestRecoverPendingRollsBackInterruptedReplace simulates a kill after the
+// first rename of a replace (old tree stashed under the deterministic backup
+// name, target absent). RecoverPending must restore the canonical install so
+// neither discovery nor a later install observes a missing target with the old
+// tree stranded under a randomized backup name.
+func TestRecoverPendingRollsBackInterruptedReplace(t *testing.T) {
+	parent := t.TempDir()
+	pluginsDir := filepath.Join(parent, "plugins")
+	id := "zero.demo"
+	target := filepath.Join(pluginsDir, id)
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, manifestFileName), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the crash: the swap moved the old tree aside and died before the
+	// new tree landed. target is gone; the old tree sits under the deterministic
+	// backup name.
+	backup := filepath.Join(parent, swapPrefix+id)
+	if err := os.Rename(target, backup); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RecoverPending(pluginsDir); err != nil {
+		t.Fatalf("RecoverPending: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(target, manifestFileName))
+	if err != nil {
+		t.Fatalf("previous install not restored: %v", err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("restored content = %q, want %q", string(data), "old")
+	}
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup must be consumed by recovery: %v", err)
+	}
+}
+
+// TestRecoverPendingCommitsCompletedReplace simulates a crash AFTER both renames
+// landed (new tree at target, old tree stranded under the backup name). Recovery
+// must commit by dropping the now-superseded backup.
+func TestRecoverPendingCommitsCompletedReplace(t *testing.T) {
+	parent := t.TempDir()
+	pluginsDir := filepath.Join(parent, "plugins")
+	id := "zero.demo"
+	target := filepath.Join(pluginsDir, id)
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, manifestFileName), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(parent, swapPrefix+id)
+	if err := os.MkdirAll(backup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backup, manifestFileName), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RecoverPending(pluginsDir); err != nil {
+		t.Fatalf("RecoverPending: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(target, manifestFileName))
+	if err != nil {
+		t.Fatalf("new install disturbed by recovery: %v", err)
+	}
+	if string(data) != "new" {
+		t.Fatalf("new content = %q, want %q", string(data), "new")
+	}
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("superseded backup must be dropped: %v", err)
+	}
+}
+
+// TestRecoverPendingSweepsOrphanedStaging ensures a crashed install's staging
+// dir is reclaimed rather than accumulating under the parent.
+func TestRecoverPendingSweepsOrphanedStaging(t *testing.T) {
+	parent := t.TempDir()
+	pluginsDir := filepath.Join(parent, "plugins")
+	if err := os.MkdirAll(pluginsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(parent, stagingPrefix+"deadbeef")
+	if err := os.MkdirAll(orphan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphan, "x"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RecoverPending(pluginsDir); err != nil {
+		t.Fatalf("RecoverPending: %v", err)
+	}
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphaned staging not swept: %v", err)
+	}
+}
+
+// TestRecoverPendingIdempotent repeats a recovery to confirm it converges to a
+// fixed point instead of thrashing: running it twice on a already-converged
+// root leaves everything unchanged.
+func TestRecoverPendingIdempotent(t *testing.T) {
+	pluginsDir := t.TempDir()
+	id := "zero.demo"
+	target := filepath.Join(pluginsDir, id)
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, manifestFileName), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(filepath.Dir(filepath.Clean(pluginsDir)), swapPrefix+id)
+	if err := os.Rename(target, backup); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := RecoverPending(pluginsDir); err != nil {
+			t.Fatalf("RecoverPending pass %d: %v", i, err)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(target, manifestFileName))
+	if err != nil {
+		t.Fatalf("previous install not restored after repeat: %v", err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("restored content = %q, want %q", string(data), "old")
+	}
+}
+
+// TestInstallRecoversInterruptedPriorReplace drives the full Install path with
+// a stranded backup from a previously-killed replace already present, and
+// checks the new install still lands cleanly (old restored then replaced),
+// with no stranded backup or staging left behind.
+func TestInstallRecoversInterruptedPriorReplace(t *testing.T) {
+	parent := t.TempDir()
+	pluginsDir := filepath.Join(parent, "plugins")
+	if err := os.MkdirAll(pluginsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	id := "zero.demo"
+	target := filepath.Join(pluginsDir, id)
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, manifestFileName), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Kill mid-replace: old tree stashed, target absent.
+	backup := filepath.Join(parent, swapPrefix+id)
+	if err := os.Rename(target, backup); err != nil {
+		t.Fatal(err)
+	}
+
+	src := writeSourcePlugin(t, filepath.Join(t.TempDir(), "src"), validManifest())
+	if _, err := Install(context.Background(), InstallOptions{Source: src, Dir: pluginsDir}); err != nil {
+		t.Fatalf("Install after interrupted prior replace: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(target, manifestFileName))
+	if err != nil {
+		t.Fatalf("target missing after recover+install: %v", err)
+	}
+	// New install lands its own manifest, not the stashed old one's content.
+	if strings.Contains(string(data), "\"old\"") {
+		t.Fatalf("install wrote the stale old tree back instead of the new one")
+	}
+	// Nothing stranded in the parent.
+	entries, _ := os.ReadDir(parent)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), swapPrefix) || strings.HasPrefix(e.Name(), stagingPrefix) {
+			t.Fatalf("stranded backup/staging after recover+install: %s", e.Name())
+		}
+	}
+}

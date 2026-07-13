@@ -172,8 +172,10 @@ func TestSwapDirIntoPlaceReplacesExisting(t *testing.T) {
 	if string(data) != "new body" {
 		t.Fatalf("target content = %q, want %q", data, "new body")
 	}
-	// No leftover backup, and staging was consumed.
-	for _, path := range []string{staging, staging + ".old"} {
+	// Staging was consumed and the deterministic backup (not the old
+	// staging+".old" spelling) is gone.
+	backup := filepath.Join(parent, swapPrefix+filepath.Base(target))
+	for _, path := range []string{staging, backup} {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("expected %s to be gone: %v", path, err)
 		}
@@ -540,5 +542,102 @@ func TestInstallHashMatchesTargetAfterSwap(t *testing.T) {
 	}
 	if lock["repro"].Hash != targetHash {
 		t.Fatalf("lockfile hash %q != target hash %q", lock["repro"].Hash, targetHash)
+	}
+}
+
+// TestRecoverPendingRollsBackInterruptedSkill simulates a kill after the first
+// rename of a skill replace: the old tree is stashed under the deterministic
+// backup name and the canonical install is absent. RecoverPending must restore
+// it so discovery never observes a half-replaced root.
+func TestRecoverPendingRollsBackInterruptedSkill(t *testing.T) {
+	parent := t.TempDir()
+	skillsDir := filepath.Join(parent, "skills")
+	name := "repro"
+	target := filepath.Join(skillsDir, name)
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, skillFileName), []byte("old body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Crash mid-replace: old tree stashed, target gone.
+	backup := filepath.Join(parent, swapPrefix+name)
+	if err := os.Rename(target, backup); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RecoverPending(skillsDir); err != nil {
+		t.Fatalf("RecoverPending: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(target, skillFileName))
+	if err != nil {
+		t.Fatalf("previous install not restored: %v", err)
+	}
+	if string(data) != "old body" {
+		t.Fatalf("restored content = %q, want %q", string(data), "old body")
+	}
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup must be consumed by recovery: %v", err)
+	}
+}
+
+// TestRecoverPendingCommitsCompletedSkill simulates a crash AFTER both renames
+// landed (new tree at target, old stranded under the backup name). Recovery must
+// commit by dropping the superseded backup.
+func TestRecoverPendingCommitsCompletedSkill(t *testing.T) {
+	parent := t.TempDir()
+	skillsDir := filepath.Join(parent, "skills")
+	name := "repro"
+	target := filepath.Join(skillsDir, name)
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, skillFileName), []byte("new body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(parent, swapPrefix+name)
+	if err := os.MkdirAll(backup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backup, skillFileName), []byte("old body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RecoverPending(skillsDir); err != nil {
+		t.Fatalf("RecoverPending: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(target, skillFileName))
+	if err != nil {
+		t.Fatalf("new install disturbed by recovery: %v", err)
+	}
+	if string(data) != "new body" {
+		t.Fatalf("new content = %q, want %q", string(data), "new body")
+	}
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("superseded backup must be dropped: %v", err)
+	}
+}
+
+// TestRecoverPendingSweepsOrphanedSkillStaging ensures a crashed skill install's
+// staging dir is reclaimed.
+func TestRecoverPendingSweepsOrphanedSkillStaging(t *testing.T) {
+	parent := t.TempDir()
+	skillsDir := filepath.Join(parent, "skills")
+	if err := os.MkdirAll(skillsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(parent, stagingPrefix+"deadbeef")
+	if err := os.MkdirAll(orphan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphan, "x"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RecoverPending(skillsDir); err != nil {
+		t.Fatalf("RecoverPending: %v", err)
+	}
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphaned staging not swept: %v", err)
 	}
 }
