@@ -230,6 +230,18 @@ const swapPrefix = ".zero-skill-replace-"
 // stagingPrefix marks a transient staging directory created during install.
 const stagingPrefix = ".zero-skill-install-"
 
+// swapBackupPath is the deterministic path swapDirIntoPlace stashes the
+// existing install at, and the path RecoverPending must look for it under. It
+// is a sibling of target in the install dir's PARENT (the same dir staging is
+// created in), never inside target — a move-into-self would be EINVAL — and it
+// lives where RecoverPending scans (filepath.Dir(dir)), so a stranded backup is
+// always recoverable. Both sides go through this helper so a crash between the
+// two renames is guaranteed convergent: the backup can never be written where
+// recovery does not look.
+func swapBackupPath(target string) string {
+	return filepath.Join(filepath.Dir(filepath.Dir(filepath.Clean(target))), swapPrefix+filepath.Base(target))
+}
+
 // swapDirIntoPlace atomically replaces target with the already-complete staging
 // directory. staging must live on the same filesystem as target (Install creates
 // it in the target's parent). On success staging is consumed (renamed) and target
@@ -244,7 +256,13 @@ const stagingPrefix = ".zero-skill-install-"
 // leaves target absent with the old tree stranded under a known name, and the next
 // recoverSwap (Install or Load) restores it.
 func swapDirIntoPlace(staging string, target string) error {
-	backup := filepath.Join(filepath.Dir(filepath.Clean(target)), swapPrefix+filepath.Base(target))
+	// backup lives in the install dir's PARENT (the same dir staging was created
+	// in), not inside target and not inside the install dir. It must be a SIBLING
+	// of target so the stash rename (target → backup) is a same-directory rename,
+	// never a move-into-self (EINVAL); and it must live where RecoverPending
+	// scans, which is filepath.Dir(dir) — i.e. this parent. The parent is on the
+	// same filesystem as target, so the rename stays atomic.
+	backup := swapBackupPath(target)
 	if err := recoverSwap(backup, target); err != nil {
 		_ = os.RemoveAll(staging)
 		return err

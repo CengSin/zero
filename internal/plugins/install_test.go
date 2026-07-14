@@ -634,3 +634,60 @@ func TestInstallRecoversInterruptedPriorReplace(t *testing.T) {
 		}
 	}
 }
+
+// TestRecoverPendingAlignsWithSwapBackupLocation guards the bug where
+// swapStagedPluginIntoPlace stashed the backup in a different directory than
+// RecoverPending scanned (backup in the install dir, scan in its parent): a
+// crash between the two renames left the canonical install absent with the old
+// tree stranded where recovery never looked. It uses the SAME backup path the
+// swap writes (swapBackupPath) to set up the interrupted state, then recovers —
+// so a drift between the write site and the scan site leaves the backup
+// stranded and the canonical install missing, failing here instead of in
+// production at crash time.
+func TestRecoverPendingAlignsWithSwapBackupLocation(t *testing.T) {
+	parent := t.TempDir()
+	pluginsDir := filepath.Join(parent, "plugins")
+	if err := os.MkdirAll(pluginsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	id := "zero.demo"
+	target := filepath.Join(pluginsDir, id)
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, manifestFileName), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	staging := filepath.Join(parent, stagingPrefix+"1")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, manifestFileName), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a kill AFTER the stash but BEFORE the move-in, using the exact
+	// backup path swapStagedPluginIntoPlace writes — not a hand-rolled copy of
+	// its expression. target is absent; the old tree sits at the backup path.
+	backup := swapBackupPath(target)
+	if err := os.Rename(target, backup); err != nil {
+		t.Fatalf("simulate stash: %v", err)
+	}
+
+	if err := RecoverPending(pluginsDir); err != nil {
+		t.Fatalf("RecoverPending: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(target, manifestFileName))
+	if err != nil {
+		t.Fatalf("previous install not restored from real swap backup path: %v", err)
+	}
+	if string(data) != "old" {
+		t.Fatalf("restored content = %q, want %q", string(data), "old")
+	}
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup stranded at %s where RecoverPending does not scan: %v", backup, err)
+	}
+	if _, err := os.Stat(staging); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphaned staging not swept: %v", err)
+	}
+}
