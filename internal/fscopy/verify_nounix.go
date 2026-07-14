@@ -1,5 +1,38 @@
 //go:build !unix
 
+// This file is the !unix fallback for CopyTree/HashTree traversal. On unix
+// (linux/darwin — the primary install targets, and what CI and local dev run)
+// the same functions live in verify_unix.go and are fd-held: the root is opened
+// with O_NOFOLLOW|O_DIRECTORY and recursion uses openat against the held parent
+// fd, so a source directory swapped for a symlink mid-traversal cannot redirect
+// the copy or hash outside src. That fd-held path has NO TOCTOU window.
+//
+// This !unix fallback is pathname-based instead, because there is no portable
+// openat primitive on these targets. It re-resolves child paths by name. Two
+// residual TOCTOU windows follow from that — both require an attacker with
+// write access to the source tree racing the traversal, so they are not
+// remotely reachable; the practical impact is also bounded:
+//
+//   - copyTreeAt: noFollowOpenDir already re-validates reparse points on every
+//     child directory it opens, so a child directory swapped for a junction is
+//     rejected. The remaining window is between opening+verifying a directory
+//     handle and the os.ReadDir(parent.Name()) that lists it by path — a
+//     sub-microsecond race on an already-verified directory.
+//   - hashTreeIntoPath: does NOT re-open child directories through
+//     noFollowOpenDir; it lists and stats by path, so a child directory swapped
+//     for a junction is recursed into as if ordinary. This window is wider, but
+//     it affects the recorded skills.lock hash, not the bytes copied (copyTreeAt
+//     still refuses a junction at open time). The worst case is a lockfile hash
+//     that does not match the installed tree, not installation of attacker
+//     content.
+//
+// TODO(windows): replace this pathname-based traversal with a handle-held one on
+// Windows (enumerate via the already-open directory handle, e.g.
+// NtQueryDirectoryFile/FindFirstFileEx on the handle, and recurse through
+// handles rather than re-resolved paths) so the !unix fallback only covers
+// Plan 9/WASM, which are not supported install targets. Requires a Windows
+// environment to develop and verify; deliberately not done blind.
+
 package fscopy
 
 import (
