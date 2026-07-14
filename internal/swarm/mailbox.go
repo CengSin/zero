@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/Gitlawb/zero/internal/lockutil"
 )
 
 // Mailbox is a per-agent, per-team message inbox persisted as a JSON array on
@@ -358,31 +360,32 @@ func acquireLock(lockPath string, timeout time.Duration) (func(), error) {
 				}
 				released = true
 				if data, rerr := os.ReadFile(lockPath); rerr == nil && string(data) == token {
-					os.Remove(lockPath)
+					_ = lockutil.RemoveLockFile(lockPath)
 				}
 			}, nil
 		}
 		if !isLockContended(err) {
 			return nil, fmt.Errorf("swarm: acquire lock: %w", err)
 		}
-		// Lock held: break it if stale, otherwise wait. Reclaim ATOMICALLY via
-		// rename-with-verify. The previous content==content check read the same file
-		// twice microseconds apart, so it was always "unchanged" and gave no
-		// protection — two waiters could both Remove the lock while a third recreated
-		// it via O_EXCL, leaving two live holders. Renaming the file aside means only
-		// one racer wins the rename of a given inode; the moved file's mtime is then
-		// re-checked stale before deletion, and if a holder rotated a fresh lock in
-		// the gap it is renamed back rather than stolen. (AUDIT-M13)
+		// Lock held: break it if stale via the atomic rename-with-verify in
+		// lockutil.ReclaimStaleLock (AUDIT-M13), otherwise wait.
 		if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > lockStaleAfter {
-			reclaimed := lockPath + ".stale." + token
-			if os.Rename(lockPath, reclaimed) == nil {
-				if rinfo, rerr := os.Stat(reclaimed); rerr == nil && time.Since(rinfo.ModTime()) > lockStaleAfter {
-					os.Remove(reclaimed) // genuinely stale — drop it
-				} else {
-					_ = os.Rename(reclaimed, lockPath) // young again — restore, don't steal
-				}
+			cleared, rerr := lockutil.ReclaimStaleLock(lockPath, token, func(reclaimedPath string) bool {
+				info, err := os.Stat(reclaimedPath)
+				return err == nil && time.Since(info.ModTime()) <= lockStaleAfter
+			})
+			if rerr != nil {
+				// Reclaim hit a hard failure: the rename aside failed outright, or a
+				// live holder's lock could not be put back (the lock path may be
+				// missing, so re-acquiring would break mutual exclusion). Fail closed
+				// instead of spinning to the deadline.
+				return nil, fmt.Errorf("swarm: reclaim stale lock: %w", rerr)
 			}
-			continue
+			if cleared {
+				continue // cleared a genuinely stale lock; retry the O_EXCL create now
+			}
+			// Lost the reclaim race (or it was actually fresh) — fall through to the
+			// bounded wait instead of hot-spinning on a reclaim that never wins.
 		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("swarm: timed out acquiring lock %s", filepath.Base(lockPath))
