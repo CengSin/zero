@@ -181,6 +181,7 @@ func TestProviderWizardAdvancesProviderAPIKeyAndModelSteps(t *testing.T) {
 	if got := next.providerWizard.currentProvider().ID; got != "anthropic" {
 		t.Fatalf("after down, selected provider = %q, want anthropic", got)
 	}
+	clearProviderAuthEnvForTest(t, next.providerWizard.currentProvider())
 
 	updated, _ = next.Update(testKey(tea.KeyEnter))
 	next = updated.(model)
