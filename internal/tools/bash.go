@@ -52,6 +52,10 @@ func NewScopedBashTool(workspaceRoot string, scope PathScope) Tool {
 				AdditionalProperties: false,
 			},
 			safety: promptSafety(SideEffectShell, "Shell commands can read, write, or execute programs."),
+			// One-shot shell can rewrite the workspace (and more). Serialized
+			// as WorkspaceWrite so external-mutator audits include bash; not
+			// session-bound Interactive (that is reserved for PTY/terminal tools).
+			capabilities: ToolCapabilities{Effect: EffectWorkspaceWrite, ThreadSafe: false, ResourceKeys: directoryResourceKeys},
 		},
 		workspaceRoot: normalizeWorkspaceRoot(workspaceRoot),
 		scope:         scope,

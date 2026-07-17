@@ -25,17 +25,29 @@ const TaskSchemaVersion = 1
 // ZERO must satisfy. The set is recorded by ID with every result so a published
 // number is traceable to the exact tasks that produced it.
 type TaskSet struct {
-	ID    string      `json:"id"`
-	Name  string      `json:"name,omitempty"`
-	Tasks []BenchTask `json:"tasks"`
+	ID          string      `json:"id"`
+	Name        string      `json:"name,omitempty"`
+	Description string      `json:"description,omitempty"`
+	Tasks       []BenchTask `json:"tasks"`
+	// BuildOnlyClasses lists task classes whose verificationCommand is a
+	// non-positive build check (e.g. refactor's `go build ./...`): it proves the
+	// edit compiles, not that the refactor achieved its goal. The turn benchmark
+	// reports these separately from correctness oracles so a build-pass cannot be
+	// misread as a correctness pass. Classes with a verificationCommand that are
+	// NOT listed here are treated as correctness classes; classes whose tasks
+	// carry no verificationCommand are latency-only regardless of this list.
+	BuildOnlyClasses []string `json:"buildOnlyClasses,omitempty"`
 }
 
 // BenchTask is one benchmark task. WorkspaceFixture is the relative path of the
 // task's starting workspace; VerificationCommand (optional) is the command the
-// default runner executes to decide pass/fail after ZERO finishes.
+// default runner executes to decide pass/fail after ZERO finishes. Class groups
+// the task for the turn-benchmark's per-group latency breakdown (e.g. "nav",
+// "edit", "fix"); it is optional and ignored by the pass/fail runner.
 type BenchTask struct {
 	ID                  string   `json:"id"`
 	Name                string   `json:"name,omitempty"`
+	Class               string   `json:"class,omitempty"`
 	Prompt              string   `json:"prompt"`
 	WorkspaceFixture    string   `json:"workspaceFixture,omitempty"`
 	VerificationCommand []string `json:"verificationCommand,omitempty"`

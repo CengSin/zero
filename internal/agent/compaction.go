@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/Gitlawb/zero/internal/trace"
 	"github.com/Gitlawb/zero/internal/zeroruntime"
 )
 
@@ -430,6 +431,12 @@ func (state *compactionState) maybeCompact(
 		state.lowWaterMark = size
 		return messages
 	}
+	// Only count a compaction when it actually shrank the history, so the
+	// compaction counter reflects real context reductions rather than paid
+	// no-ops that left the token budget untouched.
+	if r := trace.FromContext(ctx); r != nil {
+		r.Counter(trace.CounterCompactionCount, 1)
+	}
 	state.lowWaterMark = newSize
 	return compacted
 }
@@ -479,7 +486,11 @@ func (state *compactionState) recover(
 	// one-shot budget now so a provider that keeps returning context-limit errors
 	// after a successful compaction can't loop forever. Store the low-water mark in
 	// the SAME combined (messages + tool-defs) domain maybeCompact uses, so the
-	// proactive shrink-guard compares like with like.
+	// proactive shrink-guard compares like with like. Count it now that the shrink
+	// is confirmed, so the counter mirrors maybeCompact's real-reduction policy.
+	if r := trace.FromContext(ctx); r != nil {
+		r.Counter(trace.CounterCompactionCount, 1)
+	}
 	state.reactiveAttempted = true
 	state.lowWaterMark = state.calibratedTokens(estimateTokens(result) + estimateToolDefTokens(tools))
 	return result, true, nil

@@ -25,6 +25,7 @@ import (
 	"github.com/Gitlawb/zero/internal/specmode"
 	"github.com/Gitlawb/zero/internal/streamjson"
 	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Gitlawb/zero/internal/trace"
 	"github.com/Gitlawb/zero/internal/usage"
 	"github.com/Gitlawb/zero/internal/worktrees"
 	"github.com/Gitlawb/zero/internal/zeroruntime"
@@ -124,6 +125,12 @@ type execOptions struct {
 	// additional write roots for this run. Unioned with
 	// config.SandboxConfig.AdditionalWriteRoots at scope construction time.
 	addDirs []string
+	// tracePath, when set, writes a per-turn NDJSON trace (agenteval-compatible)
+	// to the given file path — or to stderr when the value is "-". Falls back to
+	// the ZERO_TRACE env var when the flag is absent. Off by default: a run
+	// without it leaves agent.Options.Trace nil and is byte-identical to before.
+	// The trace is pure observation — enabling it does not change agent behavior.
+	tracePath string
 }
 
 type execUsageError struct {
@@ -422,6 +429,12 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 	notify.MaybeAddWebhookSink(notifier, os.Getenv, func(format string, args ...any) {
 		fmt.Fprintf(stderr, "[notify] "+format+"\n", args...)
 	})
+	// Spec-draft runs synthesize a prompt offline and never drive a model turn, so
+	// there is no per-turn trace to emit. Reject --trace / ZERO_TRACE up front with
+	// a clear error rather than silently accepting and writing nothing.
+	if options.useSpec && resolveTracePath(options) != "" {
+		return writeExecFormatUsageError(stdout, stderr, options.outputFormat, "--trace / ZERO_TRACE are not supported for spec-draft runs")
+	}
 	if options.useSpec {
 		return runExecSpecDraft(execSpecDraftRun{
 			options:            options,
@@ -473,6 +486,24 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 	runID, err := streamjson.CreateRunID(time.Now())
 	if err != nil {
 		return writeAppError(stderr, "failed to create run id: "+err.Error(), exitCrash)
+	}
+	// Per-turn tracing is opt-in (--trace <path> or ZERO_TRACE=<path>). The
+	// recorder is stamped throughout agent.Run and the providerio seam; the run
+	// itself is byte-identical to an untraced run. We finish the recorder at the
+	// agent.Run boundary (below) so the snapshot captures exactly one turn, then
+	// serialize the snapshot on every exit path via the defer. "-" writes NDJSON
+	// to stderr; otherwise the path is created/truncated. A failure to emit is
+	// logged to stderr, never fatal.
+	tracePath := resolveTracePath(options)
+	var traceRecorder *trace.Recorder
+	var traceSnapshot *trace.TurnTrace
+	if tracePath != "" {
+		traceRecorder = trace.NewRecorder(preparedSession.Session.SessionID, runID, "")
+		defer func() {
+			if err := writeTraceSnapshot(traceSnapshot, tracePath, stderr); err != nil {
+				fmt.Fprintf(stderr, "[zero] failed to write trace: %s\n", err)
+			}
+		}()
 	}
 	writer := execEventWriter{
 		stdout:       stdout,
@@ -556,6 +587,7 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 		Model:            resolved.Provider.Model,
 		ModelSwitcher:    modelSwitcher,
 		ReasoningEffort:  forwardEffort,
+		Trace:            traceRecorder,
 		Cwd:              workspaceRoot,
 		Images:           images,
 		Registry:         registry,
@@ -625,6 +657,12 @@ func runExec(args []string, stdout io.Writer, stderr io.Writer, deps appDeps) in
 			sessionRecorder.append(sessions.EventUsage, payload)
 		},
 	})
+	// Finish the trace now that the turn is done, so the snapshot captures exactly
+	// agent.Run's work and nothing the post-run cleanup stamps. The deferred
+	// writer serializes the snapshot on every exit path.
+	if traceRecorder != nil {
+		traceSnapshot = traceRecorder.Finish()
+	}
 	notifier.Notify(notify.Completion, notify.DefaultMessage(notify.Completion))
 	if writer.err != nil {
 		return exitCrash
@@ -815,12 +853,26 @@ func buildExecSandboxEngine(workspaceRoot string, resolved config.ResolvedConfig
 	policy := applyConfiguredSandboxPolicy(sandbox.DefaultPolicy(), resolved.Sandbox)
 	backend := deps.selectSandboxBackend(sandbox.BackendOptions{})
 	return sandbox.NewEngine(sandbox.EngineOptions{
-		WorkspaceRoot: workspaceRoot,
-		Policy:        policy,
-		Store:         store,
-		Backend:       backend,
-		Scope:         scope,
+		WorkspaceRoot:    workspaceRoot,
+		Policy:           policy,
+		Store:            store,
+		Backend:          backend,
+		Scope:            scope,
+		SensitiveEnvKeys: providerSensitiveEnvKeys(resolved),
 	}), nil
+}
+
+func providerSensitiveEnvKeys(resolved config.ResolvedConfig) []string {
+	keys := make([]string, 0, len(resolved.Providers)+1)
+	for _, profile := range resolved.Providers {
+		if key := strings.TrimSpace(profile.APIKeyEnv); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	if key := strings.TrimSpace(resolved.Provider.APIKeyEnv); key != "" {
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 // applyConfiguredSandboxPolicy overlays every config-sourced sandbox knob onto
@@ -1236,4 +1288,37 @@ func execNotifyMode(options execOptions, resolved config.ResolvedConfig) string 
 		return options.notifyMode
 	}
 	return resolved.Notify.Mode
+}
+
+// resolveTracePath returns the trace destination for this run: the --trace flag
+// value when set, else the ZERO_TRACE env var, else "" (tracing off). A value of
+// "-" means "write to stderr".
+func resolveTracePath(options execOptions) string {
+	if v := strings.TrimSpace(options.tracePath); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("ZERO_TRACE")); v != "" {
+		return v
+	}
+	return ""
+}
+
+// writeTraceSnapshot writes an already-finished trace snapshot to dest ("-" =>
+// stderr, otherwise a file path created/truncated). A nil snapshot is a no-op
+// (tracing off, or the run exited before agent.Run produced a turn). The trace
+// is best-effort: a write error is returned to the caller, which logs it but
+// never fails the run.
+func writeTraceSnapshot(snapshot *trace.TurnTrace, dest string, stderr io.Writer) error {
+	if snapshot == nil || dest == "" {
+		return nil
+	}
+	if strings.TrimSpace(dest) == "-" {
+		return trace.WriteNDJSON(stderr, snapshot)
+	}
+	file, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return trace.WriteNDJSON(file, snapshot)
 }

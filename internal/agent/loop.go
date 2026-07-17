@@ -15,6 +15,7 @@ import (
 	"github.com/Gitlawb/zero/internal/sandbox"
 	"github.com/Gitlawb/zero/internal/streamjson"
 	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Gitlawb/zero/internal/trace"
 	"github.com/Gitlawb/zero/internal/zeroruntime"
 )
 
@@ -114,6 +115,26 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 		return Result{}, errors.New("agent provider is required")
 	}
 
+	// Tracing is opt-in. When a recorder is wired, thread it into ctx so the
+	// providerio seam and reconnect helper can reach it via trace.FromContext,
+	// mark the run's start, and wrap OnUsage so token counters accumulate for
+	// free alongside the existing per-request plumbing. nil recorder leaves the
+	// loop byte-identical: FromContext returns nil, the no-op stamps cost
+	// nothing, and the OnUsage wrapper is not installed.
+	if options.Trace != nil {
+		ctx = trace.WithContext(ctx, options.Trace)
+		options.Trace.Start()
+		originalOnUsage := options.OnUsage
+		options.OnUsage = func(usage Usage) {
+			if originalOnUsage != nil {
+				originalOnUsage(usage)
+			}
+			options.Trace.Counter(trace.CounterInputTokens, int64(usage.InputTokens))
+			options.Trace.Counter(trace.CounterCachedInputTokens, int64(usage.CachedInputTokens))
+			options.Trace.Counter(trace.CounterOutputTokens, int64(usage.OutputTokens))
+		}
+	}
+
 	maxTurns := options.MaxTurns
 	if maxTurns <= 0 {
 		maxTurns = 12
@@ -164,7 +185,11 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 	result = Result{Messages: copyMessages(messages)}
 	dispatchSessionStart(ctx, options)
 	defer func() {
-		dispatchSessionEnd(ctx, options, result, err)
+		// Use a context detached from ctx's cancellation: on Esc/Ctrl+C the run
+		// context is already canceled by the time this defer runs, and a canceled
+		// parent would make Hooks.Dispatch's context.WithTimeout derive an
+		// already-expired context, so the sessionEnd hook would never actually run.
+		dispatchSessionEnd(context.WithoutCancel(ctx), options, result, err)
 	}()
 	for turn := 0; turn < maxTurns; turn++ {
 		result.Turns = turn + 1
@@ -184,12 +209,40 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 		// the tool-definition tokens (they ride on every request) in its estimate.
 		// partitionTools depends only on registry/permissions/options/loaded, not on
 		// the messages, so computing it before compaction is safe.
+		// Build the per-turn tool list first so proactive compaction can include
+		// the tool-definition tokens (they ride on every request) in its estimate.
+		// partitionTools depends only on registry/permissions/options/loaded, not on
+		// the messages, so computing it before compaction is safe.
+		toolPartitionSpan := options.Trace.Span(trace.SpanToolPartition)
 		exposed, _ := partitionToolsCached(registry, permissionMode, options, loaded, toolDefCache)
+		toolPartitionSpan.End()
+
+		// Prompt-prefix fingerprint: hash the seven cacheable sub-components
+		// of this turn's request (system prompt sections, project context,
+		// skills, partitioned tool list, tool schemas) and emit one trace
+		// event. Stable across turns => cacheable. Drift in any sub-hash
+		// names the sub-component that broke the cache for this turn. The
+		// computation is pure and cheap (seven SHA-256s of small strings)
+		// and is a no-op when tracing is off.
+		if options.Trace != nil {
+			fp := ComputePrefixFingerprint(options, exposed)
+			options.Trace.EmitPrefixHash(trace.PrefixHash{
+				BaseInstructionsHash:   fp.BaseInstructionsHash,
+				ConfirmationPolicyHash: fp.ConfirmationPolicyHash,
+				ProjectContextHash:     fp.ProjectContextHash,
+				SkillsHash:             fp.SkillsHash,
+				ToolsHash:              fp.ToolsHash,
+				SchemaHash:             fp.SchemaHash,
+				CompletePrefixHash:     fp.CompletePrefixHash,
+			})
+		}
 
 		// PROACTIVE compaction: if the history is approaching the model's
 		// context window, summarize the oldest middle before building the
 		// request. A no-op when ContextWindow == 0 (compaction disabled).
+		compactionSpan := options.Trace.Span(trace.SpanCompaction)
 		messages = compactor.maybeCompact(ctx, provider, messages, exposed)
+		compactionSpan.End()
 		request := zeroruntime.CompletionRequest{
 			Messages:        copyMessages(messages),
 			Tools:           exposed,
@@ -255,11 +308,39 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 		// conversation-state duplication.
 		forwardedVisibleText := false
 		forwardingOpts := zeroruntime.CollectOptions{OnUsage: options.OnUsage}
-		if options.OnText != nil {
-			forwardingOpts.OnText = func(s string) { forwardedVisibleText = true; options.OnText(s) }
+		// Install text/reasoning forwarding handlers whenever EITHER a user
+		// callback OR a trace recorder is set. A headless traced run (e.g. `zero
+		// exec --trace`) sets Trace but no OnText/OnReasoning; without these
+		// handlers the stream is still collected, but FirstTokenAt would never
+		// stamp and the trace would lose its TTFT signal. The trace recorder's
+		// stamp methods are nil-safe, but we guard on `trace != nil` so a run with
+		// a user callback but no recorder still works. forwardedVisibleText stays
+		// tied to the USER callback only, preserving the stall-retry semantics
+		// (a trace-only handler forwards nothing the user would see duplicated).
+		rec := options.Trace
+		onText := options.OnText
+		if onText != nil || rec != nil {
+			forwardingOpts.OnText = func(s string) {
+				if rec != nil {
+					rec.StampFirstVisibleEvent()
+					rec.StampFirstToken()
+				}
+				if onText != nil {
+					forwardedVisibleText = true
+					onText(s)
+				}
+			}
 		}
-		if options.OnReasoning != nil {
-			forwardingOpts.OnReasoning = func(s string) { options.OnReasoning(s) }
+		onReasoning := options.OnReasoning
+		if onReasoning != nil || rec != nil {
+			forwardingOpts.OnReasoning = func(s string) {
+				if rec != nil {
+					rec.StampFirstToken()
+				}
+				if onReasoning != nil {
+					onReasoning(s)
+				}
+			}
 		}
 		if options.OnToolCallStart != nil {
 			forwardingOpts.OnToolCallStart = func(id, name string) { options.OnToolCallStart(id, name) }
@@ -297,14 +378,18 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 				if retryStreamErr != nil {
 					return collected, retryStreamErr
 				}
+				genSpan := options.Trace.Span(trace.SpanGeneration)
 				collected = zeroruntime.CollectStreamWithOptions(ctx, retryStream, zeroruntime.CollectOptions{
 					OnUsage: options.OnUsage,
 				})
+				genSpan.End()
 			}
 			return collected, nil
 		}
 
+		generationSpan := options.Trace.Span(trace.SpanGeneration)
 		collected := zeroruntime.CollectStreamWithOptions(ctx, stream, forwardingOpts)
+		generationSpan.End()
 		if collected.Error != "" {
 			updated, stop := recoverStreamError(collected)
 			collected = updated
@@ -357,7 +442,9 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 				result.Messages = copyMessages(messages)
 				return result, retryErr
 			}
+			stallGenSpan := options.Trace.Span(trace.SpanGeneration)
 			collected = zeroruntime.CollectStreamWithOptions(ctx, retryStream, forwardingOpts)
+			stallGenSpan.End()
 		}
 		if collected.Error != "" {
 			// Route a reissued stream's non-stall error through the SAME recovery as
@@ -459,6 +546,7 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 				if cue || planPending {
 					if continueNudges < maxContinueNudges {
 						continueNudges++
+						options.Trace.Counter(trace.CounterCompletionNudges, 1)
 						reason := "your message ended mid-step"
 						if !cue {
 							reason = "pending plan items remain — finish them, or mark them complete with update_plan if you are done"
@@ -488,6 +576,7 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 				// (no admission, no cue) then finalizes as success on the next turn.
 				if options.SelfCorrect != nil && !acceptanceRequested {
 					acceptanceRequested = true
+					options.Trace.Counter(trace.CounterAcceptanceChecks, 1)
 					messages = append(messages, zeroruntime.Message{
 						Role:    zeroruntime.MessageRoleUser,
 						Content: acceptanceVerificationNudge(),
@@ -548,20 +637,26 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 					runEnd++
 				}
 				if runEnd-index >= 2 {
+					batchSpan := options.Trace.Span(trace.SpanToolExecution)
 					precomputed = executeParallelReadBatch(ctx, registry, collected.ToolCalls, index, runEnd, permissionMode, options)
+					batchSpan.End()
 					precomputedStart, precomputedEnd = index, runEnd
 				}
 			}
 			if options.OnToolCall != nil {
 				options.OnToolCall(call)
 			}
+			options.Trace.StampFirstUsefulAction()
 			var toolResult ToolResult
 			var abortErr error
 			if index >= precomputedStart && index < precomputedEnd {
 				toolResult, abortErr = precomputed[index-precomputedStart].result, precomputed[index-precomputedStart].abortErr
 			} else {
+				toolSpan := options.Trace.Span(trace.SpanToolExecution)
 				toolResult, abortErr = executeToolCall(ctx, registry, call, permissionMode, options)
+				toolSpan.End()
 			}
+			options.Trace.Counter(trace.CounterToolCalls, 1)
 			if options.OnToolResult != nil {
 				options.OnToolResult(toolResult)
 			}
@@ -666,6 +761,7 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 				// context-window sizing, and usage attribution follow the new model.
 				provider = newProvider
 				options.Model = turnRequestedModel
+				options.Trace.Counter(trace.CounterModelSwitches, 1)
 				// KNOWN LIMITATION (deferred): the compactor's context-window budget
 				// is fixed at run start from options.ContextWindow and is NOT updated
 				// here, so a switch to a model with a different window keeps compacting
@@ -764,6 +860,7 @@ func finalAnswerAfterMaxTurns(ctx context.Context, provider Provider, messages [
 	if err != nil {
 		return "", messages, ""
 	}
+	finalGenSpan := options.Trace.Span(trace.SpanGeneration)
 	collected := zeroruntime.CollectStreamWithOptions(ctx, stream, zeroruntime.CollectOptions{
 		OnText:          options.OnText,
 		OnReasoning:     options.OnReasoning,
@@ -771,6 +868,7 @@ func finalAnswerAfterMaxTurns(ctx context.Context, provider Provider, messages [
 		OnToolCallStart: options.OnToolCallStart,
 		OnToolCallDelta: options.OnToolCallDelta,
 	})
+	finalGenSpan.End()
 	if ctx.Err() != nil || collected.Error != "" || strings.TrimSpace(collected.Text) == "" {
 		return "", messages, ""
 	}
@@ -1874,7 +1972,10 @@ func requestPermission(ctx context.Context, request PermissionRequest, options O
 	if options.OnPermissionRequest == nil {
 		return PermissionDecision{Action: PermissionDecisionDeny, Reason: request.Reason}, nil
 	}
-	return options.OnPermissionRequest(ctx, request)
+	permSpan := options.Trace.Span(trace.SpanPermissionWait)
+	decision, err := options.OnPermissionRequest(ctx, request)
+	permSpan.End()
+	return decision, err
 }
 
 func normalizePermissionDecisionAction(action PermissionDecisionAction) PermissionDecisionAction {

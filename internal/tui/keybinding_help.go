@@ -39,6 +39,8 @@ func (m model) buildKeybindingGroups() []keybindingGroup {
 				{"Shift+Enter / Alt+Enter", "insert a newline (multi-line compose)"},
 				{"Esc (\u00d72)", "cancel the run / dismiss a popup / clear the input"},
 				{"Ctrl+C", "cancel the run, then quit"},
+				{"Ctrl+X then letter", "common slash commands (m=/model, p=/provider, r=/resume, \u2026)"},
+				{"Ctrl+X ?", "list every Ctrl+X slash shortcut"},
 				{"?", "show this help (on an empty input)"},
 			},
 		},
@@ -47,7 +49,7 @@ func (m model) buildKeybindingGroups() []keybindingGroup {
 			bindings: []keybinding{
 				{labelOr(m.keyBindings.cycleReasoning, "Ctrl+T"), "cycle reasoning effort (auto \u2192 low \u2192 medium \u2192 high)"},
 				{"Shift+Tab", "cycle permission mode (auto \u2194 ask)"},
-				{labelOr(m.keyBindings.togglePlan, "Ctrl+P"), "expand / collapse the plan panel"},
+				{labelOr(m.keyBindings.togglePlan, "Ctrl+P"), "expand / collapse the plan panel (when no menu is open)"},
 			},
 		},
 		{
@@ -55,6 +57,7 @@ func (m model) buildKeybindingGroups() []keybindingGroup {
 			bindings: []keybinding{
 				{"PgUp / PgDn", "scroll the transcript by a page"},
 				{"\u2191 / \u2193", "scroll, or move within a popup / multi-line input"},
+				{"Ctrl+P / Ctrl+N", "previous / next item in menus (emacs-style)"},
 				{labelOr(m.keyBindings.toggleDetailed, "Ctrl+O"), "toggle the detailed (full-screen) transcript"},
 				{labelOr(m.keyBindings.toggleSidebar, "Ctrl+B"), "hide / show the right context sidebar"},
 				{labelOr(m.keyBindings.toggleMouse, "Ctrl+E"), "release the mouse to drag-select & copy text"},

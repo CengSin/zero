@@ -7,6 +7,7 @@ import (
 	"github.com/Gitlawb/zero/internal/sandbox"
 	"github.com/Gitlawb/zero/internal/streamjson"
 	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Gitlawb/zero/internal/trace"
 	"github.com/Gitlawb/zero/internal/zeroruntime"
 )
 
@@ -279,6 +280,16 @@ type Options struct {
 	// request), so every existing caller is unaffected. A returned error is
 	// non-fatal: the run continues on the current model.
 	ModelSwitcher func(ctx context.Context, modelID string) (Provider, error)
+	// Trace, when set, records per-turn timing for the run: the loop stamps
+	// spans (prompt build, generation, tool execution, permission wait,
+	// compaction, provider connect) and counters (model requests, tool calls,
+	// retries, tokens) into it. nil DISABLES tracing entirely — every stamp is
+	// nil-safe and the loop is byte-identical to an untraced run. The caller
+	// owns the recorder: Run stamps into it but does not Finish or emit it.
+	// A fresh Recorder is required per Run — reusing one across runs merges
+	// their spans, counters, and first-event timestamps, and Finish freezes a
+	// recorder so no further stamps take.
+	Trace *trace.Recorder
 	// SelfCorrect, when set, runs a post-edit verify-and-correct cycle after a
 	// mutating tool call: it verifies the changed files (LSP diagnostics + project
 	// tests) and feeds failures back to the model to fix, bounded by an attempt
