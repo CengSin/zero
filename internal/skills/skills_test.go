@@ -1,8 +1,8 @@
 package skills
 
 import (
-	"fmt"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
