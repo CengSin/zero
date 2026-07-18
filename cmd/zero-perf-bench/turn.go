@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Gitlawb/zero/internal/execprofile"
 	"github.com/Gitlawb/zero/internal/perfbench"
 )
 
@@ -20,6 +21,7 @@ type turnOptions struct {
 	SuitePath   string
 	Model       string
 	Mode        string
+	ExecProfile string
 	SelfCorrect bool
 	Binary      string
 	Iterations  int
@@ -64,6 +66,7 @@ func runTurnCommand(args []string, getenv func(string) string, stdout io.Writer,
 	result, err := perfbench.RunTurnBench(context.Background(), set, perfbench.TurnBenchConfig{
 		Model:       options.Model,
 		Mode:        options.Mode,
+		ExecProfile: options.ExecProfile,
 		SelfCorrect: options.SelfCorrect,
 		Version:     options.Version,
 		Commit:      options.Commit,
@@ -137,6 +140,13 @@ func parseTurnArgs(args []string, getenv func(string) string) (turnOptions, erro
 			}
 			options.Mode = value
 			index = next
+		case "--exec-profile":
+			value, next, err := readOptionValue(args, inlineValue, index, flag)
+			if err != nil {
+				return options, err
+			}
+			options.ExecProfile = value
+			index = next
 		case "--binary":
 			value, next, err := readOptionValue(args, inlineValue, index, flag)
 			if err != nil {
@@ -209,6 +219,20 @@ func parseTurnArgs(args []string, getenv func(string) string) (turnOptions, erro
 	if strings.TrimSpace(options.Model) == "" && !options.DryRun {
 		return options, fmt.Errorf("--model is required (or pass --dry-run)")
 	}
+	// Validate the profile here, before anything spawns: an unknown name would
+	// otherwise make every child exit with a usage error in milliseconds, and
+	// those near-zero walls would be recorded as valid latency samples in an
+	// exit-0 report — exactly the misread-as-improvement trap the harness
+	// closed for spawn failures. Normalizing to the catalog name also keeps
+	// the stamped execProfile canonical (Lookup is case-insensitive), so two
+	// captures of the same posture always compare equal.
+	if raw := strings.TrimSpace(options.ExecProfile); raw != "" {
+		profile, ok := execprofile.Lookup(raw)
+		if !ok {
+			return options, fmt.Errorf("unknown execution profile %q for --exec-profile. Valid profiles: %s", raw, strings.Join(execprofile.Names(), ", "))
+		}
+		options.ExecProfile = profile.Name
+	}
 	return options, nil
 }
 
@@ -239,6 +263,9 @@ func turnHelpText() string {
 		"  --suite <path>      Task set JSON file (required)",
 		"  --model <model>     Model to run (required unless --dry-run)",
 		"  --mode <name>       Exec mode preset to apply",
+		"  --exec-profile <name>",
+		"                      Execution profile for every task (fast|balanced|thorough);",
+		"                      forwarded to zero exec and stamped into the result",
 		"  --self-correct      Enable the post-edit verify-and-correct loop",
 		"  --binary <path>     Path to the `zero` binary (default: zero on PATH / repo root)",
 		"  --iterations <n>    Times to run each task (default: 1)",
