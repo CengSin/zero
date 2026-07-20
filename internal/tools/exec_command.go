@@ -707,6 +707,18 @@ type writeStdinTool struct {
 	manager *execSessionManager
 }
 
+// UnknownExecSessionError is the result returned when write_stdin targets a
+// session_id with no live exec session. The stable recovery guidance leads and
+// the numeric id trails on purpose: the agent's repeated-failure guard keys on
+// a normalized, truncated prefix of the error string, so keeping the id out of
+// that prefix makes a model probing ids 1, 2, 3, … produce ONE signature that
+// finally trips the halt instead of a fresh signature per id — while also
+// telling the model how to actually recover. See TestUnknownExecSessionErrorSignatureIsIDInvariant
+// in internal/agent, which pins this invariant against the real guard.
+func UnknownExecSessionError(sessionID int) string {
+	return fmt.Sprintf("Error: write_stdin needs a session_id returned by a still-running exec_command; do not guess or probe session ids. Start a process with exec_command, or use write_file/edit_file/apply_patch for file changes. (no live session %d)", sessionID)
+}
+
 func (writeStdinTool) outputCategory(map[string]any) outputCategory {
 	return outputCategoryProcess
 }
@@ -722,7 +734,7 @@ func NewWriteStdinTool(manager *execSessionManager) Tool {
 			parameters: Schema{
 				Type: "object",
 				Properties: map[string]PropertySchema{
-					"session_id":        {Type: "integer", Description: "Identifier of the running unified exec session."},
+					"session_id":        {Type: "integer", Description: "Identifier of a running unified exec session, as returned by exec_command. Never guess or probe ids.", Minimum: intPtr(1)},
 					"chars":             {Type: "string", Description: "Bytes to write to stdin. Defaults to empty, which polls without writing.", Default: ""},
 					"yield_time_ms":     {Type: "integer", Description: "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait 5000-300000 ms by default.", Default: defaultPollYieldTimeMS, Minimum: intPtr(1), Maximum: intPtr(maxPollYieldTimeMS)},
 					"max_output_tokens": {Type: "integer", Description: "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy.", Default: defaultMaxOutputTokens, Minimum: intPtr(1), Maximum: intPtr(maxExecOutputTokenRequest)},
@@ -763,12 +775,20 @@ func (tool writeStdinTool) Run(ctx context.Context, args map[string]any) Result 
 }
 
 func (tool writeStdinTool) RunWithOptions(ctx context.Context, args map[string]any, _ RunOptions) Result {
-	if value, ok := args["session_id"]; !ok || value == nil {
-		return errorResult("Error: Invalid arguments for write_stdin: session_id is required")
-	}
-	sessionID, err := intArg(args, "session_id", 0, 1, 0)
-	if err != nil {
-		return errorResult("Error: Invalid arguments for write_stdin: " + err.Error())
+	// A missing, non-integer, or < 1 session_id all mean the same thing: the model
+	// has no live session to write to. Route them to the SAME recovery guidance the
+	// no-live-session case uses (UnknownExecSessionError) instead of a terse
+	// "session_id must be at least 1". The terse error gives no way forward and, by
+	// naming the minimum, nudges the model to try 1, 2, 3... — the exact id-probing
+	// #749 works to suppress. The recovery message instead tells it to start a
+	// session or edit files directly, and because that message is id-invariant, the
+	// missing/zero/non-integer entry points and id-probing collapse to ONE
+	// repeated-failure signature, so any mix of them accumulates toward the halt
+	// rather than resetting the streak on each class of mistake.
+	value, present := args["session_id"]
+	sessionID, sessionErr := intArg(args, "session_id", 0, 1, 0)
+	if !present || value == nil || sessionErr != nil {
+		return errorResult(UnknownExecSessionError(sessionID))
 	}
 	chars, err := stringArgWithEmpty(args, "chars", "", false, true)
 	if err != nil {
@@ -784,7 +804,7 @@ func (tool writeStdinTool) RunWithOptions(ctx context.Context, args map[string]a
 	}
 	session, ok := tool.manager.get(sessionID)
 	if !ok {
-		return errorResult(fmt.Sprintf("Error: Unknown exec session_id %d.", sessionID))
+		return errorResult(UnknownExecSessionError(sessionID))
 	}
 	session.touch()
 	interrupted := false

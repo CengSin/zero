@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"sort"
 
 	"github.com/Gitlawb/zero/internal/redaction"
 	"github.com/Gitlawb/zero/internal/sandbox"
@@ -113,6 +114,9 @@ func (registry *Registry) All() []Tool {
 	for _, tool := range registry.tools {
 		tools = append(tools, tool)
 	}
+	sort.Slice(tools, func(left, right int) bool {
+		return tools[left].Name() < tools[right].Name()
+	})
 	return tools
 }
 

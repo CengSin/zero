@@ -47,6 +47,7 @@ const (
 	commandCopy
 	commandExport
 	commandNew
+	commandBTW
 	commandSkills
 	commandLoop
 	commandVoice
@@ -193,6 +194,13 @@ var commandDefinitions = []commandDefinition{
 		kind:        commandNew,
 	},
 	{
+		name:        "/btw",
+		usage:       "/btw [question]",
+		group:       commandGroupSession,
+		description: "Open an isolated side conversation; run /btw again to return.",
+		kind:        commandBTW,
+	},
+	{
 		name:        "/search",
 		aliases:     []string{"/find"},
 		usage:       "/search <query>",
@@ -253,6 +261,7 @@ var commandDefinitions = []commandDefinition{
 	},
 	{
 		name:        "/rewind",
+		aliases:     []string{"/undo"},
 		usage:       "/rewind [latest|<sequence>]",
 		group:       commandGroupSession,
 		description: "Restore workspace files to a checkpoint and truncate the session.",

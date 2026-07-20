@@ -106,6 +106,7 @@ func WriteNDJSON(w io.Writer, t *TurnTrace) error {
 	for _, p := range t.PrefixHashes {
 		if err := enc.Encode(map[string]any{
 			"type":                "prefix_hash",
+			"system_prompt":       p.SystemPromptHash,
 			"base_instructions":   p.BaseInstructionsHash,
 			"confirmation_policy": p.ConfirmationPolicyHash,
 			"project_context":     p.ProjectContextHash,
@@ -132,6 +133,27 @@ func WriteNDJSON(w io.Writer, t *TurnTrace) error {
 			"truncated":                 event.Truncated,
 			"reason":                    event.Reason,
 			"spill_created":             event.SpillCreated,
+		}); err != nil {
+			return err
+		}
+	}
+	for _, event := range t.TaskStates {
+		if err := enc.Encode(map[string]any{
+			"type":                 "task_state",
+			"revision":             event.Revision,
+			"status":               event.Status,
+			"plan_pending":         event.PlanPending,
+			"plan_in_progress":     event.PlanInProgress,
+			"plan_completed":       event.PlanCompleted,
+			"plan_failed":          event.PlanFailed,
+			"tools_succeeded":      event.ToolsSucceeded,
+			"tools_failed":         event.ToolsFailed,
+			"verification_passed":  event.VerificationPassed,
+			"verification_failed":  event.VerificationFailed,
+			"verification_outcome": event.VerificationOutcome,
+			"changed_file_count":   event.ChangedFileCount,
+			"completion_decision":  event.CompletionDecision,
+			"plan_parity":          event.PlanParity,
 		}); err != nil {
 			return err
 		}
@@ -204,6 +226,15 @@ func WriteText(w io.Writer, t *TurnTrace) error {
 				event.EstimatedRetainedTokens, event.EstimatedOriginalTokens,
 				event.Truncated, event.Reason, event.SpillCreated)
 		}
+	}
+	if len(t.TaskStates) > 0 {
+		latest := t.TaskStates[len(t.TaskStates)-1]
+		write("task state: revision=%d status=%s plan=%d/%d/%d/%d tools=%d/%d verification=%d/%d(%s) files=%d plan_parity=%s completion=%s\n",
+			latest.Revision, latest.Status, latest.PlanPending, latest.PlanInProgress,
+			latest.PlanCompleted, latest.PlanFailed, latest.ToolsSucceeded,
+			latest.ToolsFailed, latest.VerificationPassed, latest.VerificationFailed,
+			latest.VerificationOutcome, latest.ChangedFileCount, latest.PlanParity,
+			latest.CompletionDecision)
 	}
 	return firstErr
 }

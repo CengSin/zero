@@ -103,6 +103,11 @@ type model struct {
 	doctorFrame          int
 	activeSession        sessions.Metadata
 	sessionEvents        []sessions.Event
+	btw                  btwState
+	// btwRunIDSeq is the highest run ID issued by any completed or abandoned BTW
+	// surface. It survives returning to the parent so a late message from an old
+	// side run can never match a run in a later BTW conversation.
+	btwRunIDSeq int
 	// titledSessions records session ids for which a model-generated title has
 	// already been attempted this process, so a finished turn re-fires the title
 	// generator at most once per session (even before its async result lands).
@@ -307,16 +312,23 @@ type model struct {
 	chatBodyLines int
 
 	// Flush-frontier state (see flush.go). In inline mode, transcript[:flushed]
-	// is already in native scrollback; in alt-screen mode this frontier stays
-	// idle so history cannot reveal prior shell output.
+	// is already in native scrollback. Alt-screen mode advances the same
+	// frontier, but keeps the settled prefix as cached body items so fullscreen
+	// scrolling still exposes the complete transcript without rebuilding it on
+	// every frame.
 	// flushedAny gates the first turn-separator blank line; flushQueue/
 	// printInFlight serialize ordered scrollback prints; headerPrinted records
 	// the one-time inline title-bar print at startup.
-	flushed       int
-	flushedAny    bool
-	flushQueue    []string
-	printInFlight bool
-	headerPrinted bool
+	flushed                  int
+	flushedAny               bool
+	flushedPreviousKind      rowKind
+	flushedHavePreviousKind  bool
+	flushQueue               []string
+	printInFlight            bool
+	headerPrinted            bool
+	altScreenSettledItems    []transcriptBodyItem
+	altScreenSettledWidth    int
+	altScreenSettledFrontier int
 
 	// Composer input history (shell-style ↑/↓ recall of submitted inputs).
 	// lastPrompt is the verbatim text of the most recent submitted prompt, so
@@ -396,8 +408,9 @@ type model struct {
 	// mouseReleased, when true, forces terminal mouse capture OFF so the user can
 	// drag-select and copy text natively (Ctrl+E toggles it). App mouse features
 	// (clickable suggestions, right-click paste, transcript select) pause while on.
-	mouseReleased       bool
-	transcriptSelection transcriptSelectionState
+	mouseReleased         bool
+	transcriptSelection   transcriptSelectionState
+	transcriptInteraction *transcriptRenderInteraction
 	// hover identifies the single clickable row (if any) currently under the
 	// mouse cursor with no button pressed, so it renders in a distinct style —
 	// the visual cue that it's clickable. Requires AllMotion mouse reporting
@@ -836,6 +849,7 @@ func newModel(ctx context.Context, options Options) model {
 		usageTracker:                usageTracker,
 		transcript:                  initialTranscript(),
 		transcriptBodyHeights:       newTranscriptBodyHeightCache(defaultTranscriptBodyHeightCacheMaxEntries),
+		transcriptInteraction:       &transcriptRenderInteraction{},
 		prService:                   prService,
 		prState:                     prService.GetState(),
 		input:                       input,
@@ -1029,6 +1043,14 @@ func (m model) shutdownLSPManager() {
 }
 
 func (m model) handleCtrlC() (tea.Model, tea.Cmd) {
+	if m.btw.active {
+		if !m.pending && m.composerValue() != "" && m.noBlockingModal() && !m.transcriptDetailed && !m.subchat.active {
+			m.clearComposer()
+			m.clearSuggestions()
+			return m, nil
+		}
+		return m.leaveBTW()
+	}
 	if !m.pending && m.composerValue() != "" && m.noBlockingModal() && !m.transcriptDetailed && !m.subchat.active {
 		m.clearComposer()
 		m.clearSuggestions()
@@ -1108,6 +1130,12 @@ func batchCommands(cmds ...tea.Cmd) tea.Cmd {
 }
 
 func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if size, ok := msg.(tea.WindowSizeMsg); ok {
+		m = m.resizeBTWParent(size)
+	}
+	if next, cmd, routed := m.routeBTWParentMessage(msg); routed {
+		return next, cmd
+	}
 	switch msg := msg.(type) {
 	case composerBlinkMsg:
 		switch {
@@ -1453,7 +1481,7 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// selection is a passive highlight, so Esc dropping it is cheap and
 			// expected (mirrors how editors clear selection on Esc).
 			if m.selectedFile != "" {
-				m.selectedFile = ""
+				m.setSelectedFile("")
 				return m, nil
 			}
 			if m.hasQueuedMessage() {
@@ -2450,7 +2478,12 @@ func (m model) updateModel(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Collapse a repeated swarm status/collect card so re-checks don't flood
 		// the chat with identical blocks.
+		beforeCollapse := len(m.transcript)
 		m.transcript = collapseRepeatedStatusCard(m.transcript, msg.row)
+		if removed := beforeCollapse - len(m.transcript); removed > 0 {
+			m.flushed = max(0, m.flushed-removed)
+			m.altScreenSettledWidth = 0
+		}
 		m.transcript = appendTranscriptRow(m.transcript, msg.row)
 		m = m.captureStepWork(msg.row)
 		// A finished command tool may have mutated files git can see but no
@@ -4114,6 +4147,21 @@ func (m model) handleSubmit() (tea.Model, tea.Cmd) {
 // dispatchCommand runs a parsed slash/prompt command after submit/leader
 // preamble (history, composer clear, leave-prompt disarm) has already run.
 func (m model) dispatchCommand(command parsedCommand) (tea.Model, tea.Cmd) {
+	if m.btw.active && command.kind == commandExit && m.btw.parent != nil &&
+		(m.btw.parent.pending || m.btw.parent.compactInFlight || len(m.btw.parent.flushRunIDs) > 0) {
+		m.transcript = reduceTranscript(m.transcript, transcriptAction{
+			kind: actionAppendSystem,
+			text: "The main session is still running. Return to it first with /btw or Ctrl+C before exiting.",
+		})
+		return m, nil
+	}
+	if m.btw.active && btwCommandUnavailable(command) {
+		m.transcript = reduceTranscript(m.transcript, transcriptAction{
+			kind: actionAppendSystem,
+			text: command.name + " is unavailable in a BTW conversation. Return to the main session first with /btw or Ctrl+C.",
+		})
+		return m, nil
+	}
 	switch command.kind {
 	case commandEmpty:
 		return m, nil
@@ -4152,6 +4200,8 @@ func (m model) dispatchCommand(command parsedCommand) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m.startNewSession(), nil
+	case commandBTW:
+		return m.handleBTWCommand(command.text)
 	case commandLoop:
 		return m.handleLoopCommand(command.text)
 	case commandExit:
