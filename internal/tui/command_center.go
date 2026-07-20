@@ -697,6 +697,14 @@ func (m model) persistSelectedModel(profile config.ProviderProfile) (bool, error
 	if model == "" {
 		return false, nil
 	}
+	persisted, err := config.ProviderPersisted(path, name)
+	if err != nil {
+		return false, err
+	}
+	if !persisted {
+		// Env-derived providers have no config.json row to update.
+		return false, nil
+	}
 	if _, err := config.SetProviderModel(path, name, model); err != nil {
 		return false, err
 	}
